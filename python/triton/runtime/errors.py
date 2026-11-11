@@ -82,3 +82,20 @@ class HSACOError(TritonError):
     def __str__(self) -> str:
         error_message = self.error_message or ""
         return f"HSACO error: {error_message}"
+
+
+class CompileTimeoutError(TritonError):
+    """Raised when kernel compilation exceeds FLAGTREE_COMPILE_TIMEOUT_SEC."""
+
+    def __init__(self, timeout_sec: float, kernel_name: str = "", config_desc: str = ""):
+        self.timeout_sec = float(timeout_sec)
+        self.kernel_name = kernel_name
+        self.config_desc = config_desc
+
+    def __str__(self) -> str:
+        target = f" for {self.kernel_name}" if self.kernel_name else ""
+        cfg = f" ({self.config_desc})" if self.config_desc else ""
+        return f"Compilation timed out after {self.timeout_sec:.2f}s{target}{cfg}"
+
+    def __reduce__(self):
+        return (type(self), (self.timeout_sec, self.kernel_name, self.config_desc))

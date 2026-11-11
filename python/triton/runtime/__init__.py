@@ -29,8 +29,18 @@ from .autotuner import (Autotuner, Config, Heuristics, autotune, heuristics)
 from .cache import RedisRemoteCacheBackend, RemoteCacheBackend
 from .driver import driver
 from .jit import JITFunction, KernelInterface, MockTensor, TensorWrapper, reinterpret
-from .errors import OutOfResources, InterpreterError
-from ._distributed import DistributedRtContext
+from .errors import CompileTimeoutError, OutOfResources, InterpreterError
+from ._distributed import (
+    CoordinatedDispatchDecision,
+    DistributedDispatchGuard,
+    DistributedRtContext,
+    FallbackRecord,
+    GLOBAL_FALLBACK_REGISTRY,
+    OOMRecoveryController,
+    PerfRiskLevel,
+    RankDispatchState,
+)
+from ._async_compile import GLOBAL_COMPILE_BLACKLIST, run_with_compile_timeout
 from .shape_bucketing import (
     BucketCacheBudget,
     BucketLookupResult,
@@ -62,6 +72,16 @@ __all__ = [
     "TensorWrapper",
     # flagtree tle distributed
     "DistributedRtContext",
+    "CompileTimeoutError",
+    "CoordinatedDispatchDecision",
+    "DistributedDispatchGuard",
+    "FallbackRecord",
+    "GLOBAL_COMPILE_BLACKLIST",
+    "GLOBAL_FALLBACK_REGISTRY",
+    "OOMRecoveryController",
+    "PerfRiskLevel",
+    "RankDispatchState",
+    "run_with_compile_timeout",
     # flagtree online shape bucketing
     "BucketCacheBudget",
     "BucketLookupResult",

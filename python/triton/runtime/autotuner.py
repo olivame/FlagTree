@@ -32,7 +32,7 @@ from typing import Dict, Tuple, List, Optional
 
 from .. import knobs
 from .jit import KernelInterface, JITFunction
-from .errors import BackendCompilerError, OutOfResources, PTXASError, AutotunerError
+from .errors import BackendCompilerError, CompileTimeoutError, OutOfResources, PTXASError, AutotunerError
 from .driver import driver
 from .cache import get_cache_manager, triton_key
 from .adjust_kernel_param import auto_adjust_block_sizes
@@ -206,11 +206,38 @@ class Autotuner(KernelInterface):
 
             self.post_hook(full_nargs, exception=None)
 
+        from ._async_compile import GLOBAL_COMPILE_BLACKLIST, run_with_compile_timeout
+        cfg_sig = str(config)
+        if GLOBAL_COMPILE_BLACKLIST.is_blacklisted(self.base_fn.__name__, cfg_sig):
+            return [float("inf"), float("inf"), float("inf")]
+
+        timeout_sec = knobs.autotuning.compile_timeout_sec
         try:
-            rett = self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+            if timeout_sec is not None and timeout_sec > 0:
+                rett = run_with_compile_timeout(
+                    lambda: self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8)),
+                    timeout_sec,
+                    kernel_name=self.base_fn.__name__,
+                    config_desc=cfg_sig,
+                )
+            else:
+                rett = self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
         # except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
         # flagtree tileir: prune backend compiler failures during autotuning.
-        except (OutOfResources, CompileTimeAssertionFailure, PTXASError, BackendCompilerError) as e:
+        except (OutOfResources, CompileTimeAssertionFailure, PTXASError, BackendCompilerError, CompileTimeoutError) as e:
+            if isinstance(e, (BackendCompilerError, CompileTimeoutError)):
+                GLOBAL_COMPILE_BLACKLIST.add(self.base_fn.__name__, cfg_sig, str(e))
+            if isinstance(e, CompileTimeoutError):
+                from ._distributed import GLOBAL_FALLBACK_REGISTRY, PerfRiskLevel
+                GLOBAL_FALLBACK_REGISTRY.record(
+                    self.base_fn.__name__,
+                    "autotune",
+                    (),
+                    (),
+                    reason=str(e),
+                    recovery_action="blacklist_config_and_select_next_candidate",
+                    perf_risk_level=PerfRiskLevel.LOW,
+                )
             if verbose:
                 print(f"Autotuning failed with {e}")
             rett = [float("inf"), float("inf"), float("inf")]
