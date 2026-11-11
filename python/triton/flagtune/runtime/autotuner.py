@@ -176,6 +176,7 @@ class Flagtuner(Autotuner):
         op_id: Optional[str] = None,
         variant: Optional[str] = None,
         flagtune_dtype_resolver: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        shape_policy=None,
     ):
         """Initialize Triton's baseline tuner and lazy FlagTune state."""
         if benchmark_mode is not None and use_cuda_graph is not None:
@@ -207,6 +208,7 @@ class Flagtuner(Autotuner):
             post_hook=post_hook,
             prune_configs_by=prune_configs_by,
             do_bench=resolved_benchmark.benchmark,
+            shape_policy=shape_policy,
         )
         self.benchmark_protocol = resolved_benchmark.protocol
 
@@ -342,6 +344,7 @@ def flagtune(
     use_cuda_graph=None,
     benchmark_mode: Optional[str] = None,
     benchmark_retries: int = 10,
+    shape_policy=None,
 ):
     """Decorate a Triton kernel with :class:`Flagtuner`.
 
@@ -395,6 +398,7 @@ def flagtune(
             op_id=op_id,
             variant=variant,
             flagtune_dtype_resolver=flagtune_dtype_resolver,
+            shape_policy=shape_policy,
         )
 
     return decorator

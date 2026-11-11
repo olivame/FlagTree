@@ -43,7 +43,7 @@ class Autotuner(KernelInterface):
 
     def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, pre_hook=None, post_hook=None,
                  prune_configs_by: Optional[Dict] = None, warmup=None, rep=None, use_cuda_graph=False, do_bench=None,
-                 cache_results=False):
+                 cache_results=False, shape_policy=None):
         """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
             'perf_model': performance model used to predicate running time with different configs, returns running time
@@ -119,6 +119,9 @@ class Autotuner(KernelInterface):
         self.num_reps = rep
         self.use_cuda_graph = use_cuda_graph
         self.seen_tuned_metas = {}  # flagtree aabs: deduplicate tuned meta
+        self.shape_policy = shape_policy
+        self._bucket_budget = None
+        self.last_dispatch_result = None
 
         # If we got explicitly called via the old interface, raise a warning
         # and proceed with the old behavior.
@@ -255,20 +258,54 @@ class Autotuner(KernelInterface):
                 "configs_timings":
                 [(config.__dict__, timings) for config, timings in self.configs_timings.items() if not config.pre_hook],
             }), file_name, binary=False)
+        max_artifacts = knobs.autotuning.max_bucket_artifacts
+        if max_artifacts is not None and max_artifacts > 0:
+            from .shape_bucketing import enforce_disk_cache_budget
+            enforce_disk_cache_budget(knobs.cache.dir, max_artifacts)
         return False
 
     def run(self, *args, **kwargs):
         self.seen_tuned_metas = {}  # flagtree aabs: deduplicate tuned meta
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
+        bucketing_enabled = (self.shape_policy is not None) or bool(knobs.autotuning.shape_bucketing)
         if len(self.configs) > 1:
             all_args = {**self.nargs, **kwargs}
             _args = {k: v for (k, v) in all_args.items() if k in self.arg_names}
-            key = [_args[key] for key in self.keys if key in _args]
-            for _, arg in _args.items():
-                if hasattr(arg, "dtype"):
-                    key.append(str(arg.dtype))
-            key = tuple(key)
+            raw_key = [_args[k] for k in self.keys if k in _args]
+            extra_dtypes = [str(arg.dtype) for _, arg in _args.items() if hasattr(arg, "dtype")]
+            raw_key.extend(extra_dtypes)
+            raw_key = tuple(raw_key)
+
+            lookup = None
+            if bucketing_enabled:
+                from .shape_bucketing import (
+                    BucketCacheBudget,
+                    BucketLookupResult,
+                    DispatchStatus,
+                    GLOBAL_BUCKET_TELEMETRY,
+                    resolve_tuner_policy,
+                )
+                policy = resolve_tuner_policy(
+                    self,
+                    explicit_policy=self.shape_policy,
+                    policy_path=knobs.autotuning.shape_policy_path,
+                    mode_str=knobs.autotuning.shape_bucketing_mode,
+                )
+                lookup = policy.lookup_autotune_key(_args, self.keys, extra_dtypes=extra_dtypes)
+                key = lookup.bucket_key
+            else:
+                key = raw_key
+
+            guard_mismatch = False
+            if bucketing_enabled and key in self.cache and self.early_config_prune is not None:
+                valid_cached = self.early_config_prune([self.cache[key]], self.nargs, **kwargs)
+                if not valid_cached:
+                    guard_mismatch = True
+                    key = key + ("guard_override",) + tuple(
+                        _args[k] for k in self.keys if k in _args and isinstance(_args[k], (int, str, float, bool))
+                    )
+
             if key not in self.cache:
                 used_cached_result = False
                 pruned_configs = self.prune_configs(kwargs)
@@ -289,6 +326,28 @@ class Autotuner(KernelInterface):
                     benchmark()
 
             config = self.cache[key]
+            if bucketing_enabled and lookup is not None:
+                if guard_mismatch:
+                    eff_status = DispatchStatus.GUARD_MISMATCH
+                elif lookup.status in (DispatchStatus.UNDERFLOW, DispatchStatus.OVERFLOW, DispatchStatus.GUARD_MISMATCH):
+                    eff_status = lookup.status
+                elif not used_cached_result:
+                    eff_status = DispatchStatus.COLD_TUNED
+                else:
+                    eff_status = DispatchStatus.HIT
+                self.last_dispatch_result = BucketLookupResult(
+                    bucket_key=key,
+                    status=eff_status,
+                    representative_dims=lookup.representative_dims,
+                    raw_dims=lookup.raw_dims,
+                    clamped_axes=lookup.clamped_axes,
+                )
+                GLOBAL_BUCKET_TELEMETRY.record(self.base_fn.__name__, eff_status, raw_key, key)
+                max_artifacts = knobs.autotuning.max_bucket_artifacts
+                if max_artifacts is not None and max_artifacts > 0:
+                    if self._bucket_budget is None:
+                        self._bucket_budget = BucketCacheBudget(max_artifacts)
+                    self._bucket_budget.touch_and_evict(self.cache, key, max_entries=max_artifacts)
         else:
             config = self.configs[0]
         self.best_config = config
@@ -430,7 +489,7 @@ class Config:
 
 
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
-             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False):
+             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False, shape_policy=None):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -493,7 +552,8 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     def decorator(fn):
         return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                          post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
-                         use_cuda_graph=use_cuda_graph, do_bench=do_bench, cache_results=cache_results)
+                         use_cuda_graph=use_cuda_graph, do_bench=do_bench, cache_results=cache_results,
+                         shape_policy=shape_policy)
 
     return decorator
 

@@ -299,6 +299,18 @@ class env_opt_str(env_base[Optional[str], Optional[str]]):
         return getenv(self.key)
 
 
+class env_opt_int(env_base[Optional[int], Optional[int]]):
+
+    def get(self) -> Optional[int]:
+        val = getenv(self.key)
+        if val is None or val.strip() == "":
+            return None
+        try:
+            return int(val)
+        except ValueError as exc:
+            raise RuntimeError(f"Unable to use {self.key}={val}: expected int") from exc
+
+
 class env_opt_bool(env_base):
 
     def get(self) -> Optional[str]:
@@ -450,6 +462,11 @@ class autotuning_knobs(base_knobs):
     cache: env_bool = env_bool("TRITON_CACHE_AUTOTUNING")
     print: env_bool = env_bool("TRITON_PRINT_AUTOTUNING")
     adjust_block_size: env_bool = env_bool("FLAGTREE_AABS", True)  # flagtree aabs
+    shape_bucketing: env_bool = env_bool("FLAGTREE_SHAPE_BUCKETING", False)
+    shape_bucketing_mode: env_str = env_str("FLAGTREE_SHAPE_BUCKETING_MODE", "auto")
+    shape_policy_path: env_opt_str = env_opt_str("FLAGTREE_SHAPE_POLICY_PATH")
+    max_bucket_artifacts: env_opt_int = env_opt_int("FLAGTREE_MAX_BUCKET_ARTIFACTS")
+    compile_timeout_sec: env_opt_int = env_opt_int("FLAGTREE_COMPILE_TIMEOUT_SEC")
 
 
 class LaunchHook(Protocol):

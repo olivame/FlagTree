@@ -1213,6 +1213,7 @@ def analyze_kernel_dependencies(jit_fn, pre_hook_fn: object | None = None) -> tu
 
 def clear_analysis_cache():
     _analysis_cache.clear()
+    _axis_spec_cache.clear()
 
 
 # ========
@@ -1427,3 +1428,523 @@ def auto_adjust_block_sizes(nargs, fn, configs, current, config):
         print(f'[AABS] ==== Finish: {base_fn.__name__}({nargs_str})')
         print(f'[AABS] ====         adjusted_config={config}')
         print("==============================================================\n")
+
+
+# =====================================================================
+# AST-Guided Axis Classification for Online Shape Bucketing
+# =====================================================================
+
+from dataclasses import dataclass
+from enum import Enum
+import textwrap
+
+
+class AxisRole(str, Enum):
+    """Semantic role of a kernel parameter in shape bucketing."""
+
+    DYNAMIC_TILE_DIM = "dynamic_tile_dim"
+    DYNAMIC_STRIDE = "dynamic_stride"
+    INVARIANT_CONST = "invariant_const"
+
+
+@dataclass(frozen=True)
+class KernelAxisSpec:
+    """Extracted structural constraints for one kernel parameter."""
+
+    name: str
+    role: AxisRole
+    candidate_blocks: tuple[int, ...] = ()
+    block_param_names: tuple[str, ...] = ()
+    min_block_size: int = 1
+    feeds_dot: bool = False
+    paired_dims: tuple[str, ...] = ()
+    paired_dim: str | None = None
+
+
+_axis_spec_cache: dict[tuple, dict[str, KernelAxisSpec]] = {}
+
+_SPATIAL_CONV_PREFIXES = (
+    "stride_h",
+    "stride_w",
+    "stride_d",
+    "stride_l",
+    "dilation_",
+    "pad_",
+    "padding_",
+)
+
+_INVARIANT_EXACT_NAMES = frozenset({
+    "head_dim",
+    "head_dim_actual",
+    "block_dmodel",
+    "dqk",
+    "dv",
+    "groups",
+    "topk",
+    "top_k",
+    "mode",
+    "stage",
+    "dtype_key",
+})
+
+
+def get_backend_min_dot_size(backend: str | None = None) -> tuple[int, int, int]:
+    """Return hardware ``(min_m, min_n, min_k)`` dot tile floor for ``backend``."""
+    active = FLAGTREE_BACKEND if backend is None else backend
+    if active == "sunrise":
+        return (8, 8, 16)
+    if active == "mthreads":
+        return (64, 16, 16)
+    # Default NVIDIA / Kunlunxin XPU / Ascend / Cambricon / PPU / Biren / Metax / HCU / Iluvatar
+    return (16, 16, 16)
+
+
+def _is_spatial_conv_param(name: str) -> bool:
+    low = name.lower()
+    return low.startswith(_SPATIAL_CONV_PREFIXES) or low == "groups"
+
+
+def _looks_like_memory_stride(name: str) -> bool:
+    low = name.lower()
+    if _is_spatial_conv_param(low):
+        return False
+    return low.startswith("stride_") or "_stride" in low or low.endswith("_stride")
+
+
+def _parse_jit_or_func(fn_obj) -> tuple[ast.AST | None, dict]:
+    target = fn_obj
+    while not hasattr(target, "parse") and hasattr(target, "fn"):
+        target = target.fn
+    kernel_globals = getattr(target, "__globals__", None)
+    if kernel_globals is None and hasattr(target, "fn"):
+        kernel_globals = getattr(target.fn, "__globals__", None)
+    if not isinstance(kernel_globals, dict):
+        kernel_globals = {}
+
+    if hasattr(target, "parse") and callable(target.parse):
+        return target.parse(), kernel_globals
+    raw_fn = getattr(target, "fn", target)
+    if inspect.isfunction(raw_fn):
+        src = textwrap.dedent(inspect.getsource(raw_fn))
+        return ast.parse(src), getattr(raw_fn, "__globals__", kernel_globals)
+    return None, kernel_globals
+
+
+def _collect_extended_ast_signals(
+    fn_ast: ast.AST,
+    analyzer: KernelDependencyAnalyzer,
+    kernel_globals: dict,
+    visited_helpers: set[int],
+) -> dict[str, object]:
+    """Collect bucketing-specific AST signals without mutating ``analyzer``."""
+    dim_to_blocks: dict[str, set[str]] = {}
+    invariants: set[str] = set(analyzer.constexpr_params)
+    stride_params: set[str] = set()
+    stride_to_tensor_base: dict[str, set[str]] = {}
+    tensor_base_to_dims: dict[str, set[str]] = {}
+    has_dot = bool(analyzer.dot_calls)
+
+    # 1. Seed from non-destructive tl.load analysis (preserving multi-dot maps!)
+    raw_load_map = analyzer.analyze_tl_load_bs()
+    for bs_name, ts_name in raw_load_map.items():
+        if ts_name in analyzer.input_params and ts_name not in analyzer.constexpr_params:
+            dim_to_blocks.setdefault(ts_name, set()).add(bs_name)
+
+    # Pre-scan tuple-unpacking assignments (e.g. `lo, hi = 0, KV_CTX` in FlashAttention)
+    tuple_defs: dict[str, list[ast.AST]] = {}
+    for node in ast.walk(fn_ast):
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, (ast.Tuple, ast.List)):
+                    if isinstance(node.value, (ast.Tuple, ast.List)) and len(tgt.elts) == len(node.value.elts):
+                        for lhs_el, rhs_el in zip(tgt.elts, node.value.elts):
+                            if isinstance(lhs_el, ast.Name):
+                                tuple_defs.setdefault(lhs_el.id, []).append(rhs_el)
+                    else:
+                        for lhs_el in tgt.elts:
+                            if isinstance(lhs_el, ast.Name):
+                                tuple_defs.setdefault(lhs_el.id, []).append(node.value)
+
+    def _resolve_inputs(expr_node: ast.AST, _seen: set[str] | None = None) -> set[str]:
+        if _seen is None:
+            _seen = set()
+        found: set[str] = set()
+        for v in VariableCollector.collect(expr_node):
+            if v in analyzer.input_params and v not in analyzer.constexpr_params:
+                found.add(v)
+            elif v not in analyzer.constexpr_params and v not in _seen:
+                in_deps, _ = analyzer.get_dependencies(v)
+                found.update(in_deps)
+                for rhs in tuple_defs.get(v, ()):
+                    found.update(_resolve_inputs(rhs, _seen | {v}))
+        return found
+
+    def _resolve_constexprs(expr_node: ast.AST) -> set[str]:
+        found: set[str] = set()
+        for v in VariableCollector.collect(expr_node):
+            if v in analyzer.constexpr_params:
+                found.add(v)
+            else:
+                _, ce_deps = analyzer.get_dependencies(v)
+                found.update(ce_deps)
+        return found
+
+    # 2. Extended cdiv(expr, BLOCK) and range(start, stop_expr, BLOCK) pairing
+    for call in analyzer.cdiv_calls:
+        if len(call.args) >= 2:
+            in_dims = _resolve_inputs(call.args[0])
+            ce_blks = _resolve_constexprs(call.args[1])
+            for d in in_dims:
+                if not _looks_like_memory_stride(d) and not _is_spatial_conv_param(d):
+                    dim_to_blocks.setdefault(d, set()).update(ce_blks)
+
+    # 3. Walk AST for loops with indirect bounds, static_asserts, block_ptrs, TMA, strides, stores, and helper calls
+    fndef = next((n for n in ast.walk(fn_ast) if isinstance(n, ast.FunctionDef)), None)
+    search_root = fndef if fndef is not None else fn_ast
+
+    def _inspect_address_for_strides_and_base(addr_node: ast.AST) -> str | None:
+        base_param = analyzer._find_tensor_base(addr_node)
+        for sub in ast.walk(addr_node):
+            if isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Mult):
+                for side, other in ((sub.left, sub.right), (sub.right, sub.left)):
+                    if isinstance(side, ast.Name) and side.id in analyzer.input_params and side.id not in analyzer.constexpr_params:
+                        cand = side.id
+                        if _is_spatial_conv_param(cand):
+                            invariants.add(cand)
+                            continue
+                        # Check if multiplied by pid, arange, or offset variable
+                        other_vars = VariableCollector.collect(other)
+                        is_offset_mult = _looks_like_memory_stride(cand)
+                        if not is_offset_mult:
+                            for ov in other_vars:
+                                if analyzer._extract_arange_bs_recursive(ov) or ov.startswith(("pid", "off", "rm", "rn", "rk", "row", "col", "batch", "head")):
+                                    is_offset_mult = True
+                                    break
+                        if is_offset_mult and cand not in dim_to_blocks:
+                            stride_params.add(cand)
+                            if base_param:
+                                stride_to_tensor_base.setdefault(cand, set()).add(base_param)
+        if base_param:
+            used_bs: set[str] = set()
+            for v in VariableCollector.collect(addr_node):
+                used_bs.update(analyzer._extract_arange_bs_recursive(v))
+            for bs in used_bs:
+                if bs in raw_load_map:
+                    tensor_base_to_dims.setdefault(base_param, set()).add(raw_load_map[bs])
+        return base_param
+
+    for addr_expr, _ in analyzer.load_records:
+        _inspect_address_for_strides_and_base(addr_expr)
+
+    for node in ast.walk(search_root):
+        if isinstance(node, ast.Assert):
+            for v in VariableCollector.collect(node.test):
+                if v in analyzer.input_params or v in analyzer.constexpr_params:
+                    invariants.add(v)
+
+        elif isinstance(node, ast.For):
+            it = node.iter
+            if isinstance(it, ast.Call) and len(it.args) >= 3:
+                is_range = (isinstance(it.func, ast.Name) and it.func.id == "range") or analyzer._is_tl_func(it, "range")
+                if is_range:
+                    in_dims = _resolve_inputs(it.args[1])
+                    ce_blks = _resolve_constexprs(it.args[2])
+                    for d in in_dims:
+                        if not _looks_like_memory_stride(d) and not _is_spatial_conv_param(d):
+                            dim_to_blocks.setdefault(d, set()).update(ce_blks)
+
+        elif isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Add):
+            if isinstance(node.target, ast.Name):
+                # e.g. `in_ptr += pid * x_stride_r` or `K_block_ptr += BLOCK_N * stride_k_seqlen`
+                _inspect_address_for_strides_and_base(
+                    ast.BinOp(left=ast.Name(id=node.target.id, ctx=ast.Load()), op=ast.Add(), right=node.value)
+                )
+
+        elif isinstance(node, ast.Call):
+            if analyzer._is_tl_func(node, "static_assert"):
+                for arg in node.args:
+                    for v in VariableCollector.collect(arg):
+                        if v in analyzer.input_params or v in analyzer.constexpr_params:
+                            invariants.add(v)
+
+            elif analyzer._is_tl_arange(node) and len(node.args) >= 2:
+                if isinstance(node.args[1], ast.Name):
+                    # Direct tl.arange(0, PARAM): if PARAM is also in input_params without block pairing, keep invariant
+                    if node.args[1].id in analyzer.constexpr_params:
+                        invariants.add(node.args[1].id)
+
+            elif analyzer._is_tl_func(node, "store") and len(node.args) >= 2:
+                base_p = _inspect_address_for_strides_and_base(node.args[0])
+                mask_node = node.args[2] if len(node.args) >= 3 else None
+                for kw in node.keywords:
+                    if kw.arg == "mask":
+                        mask_node = kw.value
+                if mask_node is not None:
+                    used_bs: set[str] = set()
+                    for v in VariableCollector.collect(node.args[0]):
+                        used_bs.update(analyzer._extract_arange_bs_recursive(v))
+                    for bs in used_bs:
+                        mx = analyzer._find_mask_x(mask_node, bs)
+                        if mx and mx in analyzer.input_params and mx not in analyzer.constexpr_params:
+                            dim_to_blocks.setdefault(mx, set()).add(bs)
+                            if base_p:
+                                tensor_base_to_dims.setdefault(base_p, set()).add(mx)
+
+            elif analyzer._is_tl_func(node, "make_block_ptr") or analyzer._is_tl_func(node, "make_tensor_descriptor"):
+                is_bptr = analyzer._is_tl_func(node, "make_block_ptr")
+                order_names = (
+                    ("base", "shape", "strides", "offsets", "block_shape", "order")
+                    if is_bptr
+                    else ("base", "shape", "strides", "block_shape")
+                )
+                bound: dict[str, ast.AST] = {}
+                for idx, pos_arg in enumerate(node.args):
+                    if idx < len(order_names):
+                        bound[order_names[idx]] = pos_arg
+                for kw in node.keywords:
+                    if kw.arg:
+                        bound[kw.arg] = kw.value
+                base_p = analyzer._find_tensor_base(bound["base"]) if "base" in bound else None
+                shape_elts = bound["shape"].elts if ("shape" in bound and isinstance(bound["shape"], (ast.Tuple, ast.List))) else []
+                bshape_elts = bound["block_shape"].elts if ("block_shape" in bound and isinstance(bound["block_shape"], (ast.Tuple, ast.List))) else []
+                stride_elts = bound["strides"].elts if ("strides" in bound and isinstance(bound["strides"], (ast.Tuple, ast.List))) else []
+                for s_el, b_el in zip(shape_elts, bshape_elts):
+                    if isinstance(s_el, ast.Name) and isinstance(b_el, ast.Name):
+                        if s_el.id == b_el.id:
+                            invariants.add(s_el.id)
+                        elif s_el.id in analyzer.input_params and s_el.id not in analyzer.constexpr_params:
+                            dim_to_blocks.setdefault(s_el.id, set()).add(b_el.id)
+                            if base_p:
+                                tensor_base_to_dims.setdefault(base_p, set()).add(s_el.id)
+                for st_el in stride_elts:
+                    if isinstance(st_el, ast.Name) and st_el.id in analyzer.input_params and st_el.id not in analyzer.constexpr_params:
+                        if not _is_spatial_conv_param(st_el.id):
+                            stride_params.add(st_el.id)
+                            if base_p:
+                                stride_to_tensor_base.setdefault(st_el.id, set()).add(base_p)
+
+            elif isinstance(node.func, ast.Name) and node.func.id in kernel_globals:
+                helper_obj = kernel_globals[node.func.id]
+                if id(helper_obj) not in visited_helpers:
+                    h_ast, h_globals = _parse_jit_or_func(helper_obj)
+                    if h_ast is not None:
+                        h_fndef = next((n for n in ast.walk(h_ast) if isinstance(n, ast.FunctionDef)), None)
+                        if h_fndef is not None:
+                            h_formals = [a.arg for a in h_fndef.args.args]
+                            formal_to_actual: dict[str, ast.AST] = {}
+                            for idx, actual_expr in enumerate(node.args):
+                                if idx < len(h_formals):
+                                    formal_to_actual[h_formals[idx]] = actual_expr
+                            for kw in node.keywords:
+                                if kw.arg in h_formals:
+                                    formal_to_actual[kw.arg] = kw.value
+                            h_analyzer = KernelDependencyAnalyzer(kernel_globals=h_globals)
+                            h_analyzer.visit(h_ast)
+                            # In FlagGems attention (generic & _ascend), inner @triton.jit helpers
+                            # may annotate runtime outer scalars (e.g. KV_CTX) as tl.constexpr.
+                            # Demote helper formals backed by dynamic outer inputs so loop bounds propagate.
+                            for f_name, act_expr in formal_to_actual.items():
+                                if f_name in h_analyzer.constexpr_params and _resolve_inputs(act_expr):
+                                    h_analyzer.constexpr_params.discard(f_name)
+                                    h_analyzer.input_params.add(f_name)
+                            sub_sig = _collect_extended_ast_signals(
+                                h_ast,
+                                h_analyzer,
+                                h_globals,
+                                visited_helpers | {id(helper_obj)},
+                            )
+                            if sub_sig["has_dot"]:
+                                has_dot = True
+
+                            for h_dim, h_blks in sub_sig["dim_to_blocks"].items():
+                                act_dim_node = formal_to_actual.get(h_dim)
+                                if act_dim_node is None:
+                                    continue
+                                caller_dims = _resolve_inputs(act_dim_node)
+                                caller_blks: set[str] = set()
+                                for hb in h_blks:
+                                    act_blk_node = formal_to_actual.get(hb)
+                                    if act_blk_node is not None:
+                                        caller_blks.update(_resolve_constexprs(act_blk_node))
+                                for cd in caller_dims:
+                                    if not _looks_like_memory_stride(cd) and not _is_spatial_conv_param(cd):
+                                        dim_to_blocks.setdefault(cd, set()).update(caller_blks)
+
+                            for h_st in sub_sig["stride_params"]:
+                                act_st_node = formal_to_actual.get(h_st)
+                                if isinstance(act_st_node, ast.Name) and act_st_node.id in analyzer.input_params:
+                                    if act_st_node.id not in analyzer.constexpr_params and not _is_spatial_conv_param(act_st_node.id):
+                                        stride_params.add(act_st_node.id)
+
+                            for h_inv in sub_sig["invariants"]:
+                                act_inv_node = formal_to_actual.get(h_inv)
+                                if isinstance(act_inv_node, ast.Name) and act_inv_node.id in analyzer.constexpr_params:
+                                    invariants.add(act_inv_node.id)
+
+        elif isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], (ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+            # Catch standalone boundary checks like `mask = n_offsets < N` even before load
+            left, right = node.left, node.comparators[0]
+            for ar_side, x_side in ((left, right), (right, left)):
+                if isinstance(x_side, ast.Name) and x_side.id in analyzer.input_params and x_side.id not in analyzer.constexpr_params:
+                    if _looks_like_memory_stride(x_side.id) or _is_spatial_conv_param(x_side.id):
+                        continue
+                    bs_set = set(analyzer._extract_arange_bs(ar_side))
+                    for v in VariableCollector.collect(ar_side):
+                        bs_set.update(analyzer._extract_arange_bs_recursive(v))
+                    if len(bs_set) == 1:
+                        dim_to_blocks.setdefault(x_side.id, set()).update(bs_set)
+
+    # Remove any parameter from stride_params if it has strong tile-block pairing
+    stride_params.difference_update(dim_to_blocks.keys())
+
+    return {
+        "dim_to_blocks": dim_to_blocks,
+        "invariants": invariants,
+        "stride_params": stride_params,
+        "stride_to_tensor_base": stride_to_tensor_base,
+        "tensor_base_to_dims": tensor_base_to_dims,
+        "has_dot": has_dot,
+        "raw_load_map": raw_load_map,
+    }
+
+
+def infer_bucketable_axes(
+    jit_fn,
+    configs: list | tuple | None = None,
+    keys: list[str] | tuple[str, ...] | None = None,
+    pre_hook_fn: object | None = None,
+    backend: str | None = None,
+) -> dict[str, KernelAxisSpec]:
+    """Infer ``KernelAxisSpec`` roles and tile ladders for kernel parameters via AST analysis."""
+    active_backend = FLAGTREE_BACKEND if backend is None else backend
+    cfg_sig = tuple(
+        tuple(sorted((k, v) for k, v in getattr(c, "kwargs", {}).items() if type(v) is int))
+        for c in (configs or ())
+    )
+    cache_key = (
+        id(jit_fn),
+        cfg_sig,
+        tuple(keys or ()),
+        id(pre_hook_fn) if pre_hook_fn is not None else None,
+        active_backend,
+    )
+    if cache_key in _axis_spec_cache:
+        return _axis_spec_cache[cache_key]
+
+    fn_ast, kernel_globals = _parse_jit_or_func(jit_fn)
+    if fn_ast is None:
+        return {}
+
+    try:
+        analyzer = KernelDependencyAnalyzer(kernel_globals=kernel_globals)
+        analyzer.visit(fn_ast)
+        signals = _collect_extended_ast_signals(fn_ast, analyzer, kernel_globals, {id(jit_fn)})
+
+        tma_map = analyzer.analyze_desc_load_bs(pre_hook_fn)
+        tma_m_map, tma_k_map = analyzer.analyze_tma_dot_dim(tma_map)
+        ge_m_map, ge_k_map, ge_n_map = analyzer.analyze_general_dot_dim(dict(signals["raw_load_map"]))
+
+        min_m, min_n, min_k = get_backend_min_dot_size(active_backend)
+        min_load = 4 if active_backend == "enflame" else 1
+
+        dim_to_blocks: dict[str, set[str]] = signals["dim_to_blocks"]
+        invariants: set[str] = signals["invariants"]
+        stride_params: set[str] = signals["stride_params"]
+        stride_to_tensor_base: dict[str, set[str]] = signals["stride_to_tensor_base"]
+        tensor_base_to_dims: dict[str, set[str]] = signals["tensor_base_to_dims"]
+        has_dot: bool = bool(signals["has_dot"])
+
+        # Collect candidate block sizes per constexpr block parameter across configs
+        bs_candidates: dict[str, set[int]] = {}
+        for cfg in configs or ():
+            kw = getattr(cfg, "kwargs", None) or {}
+            for bk, bv in kw.items():
+                if type(bv) is int and bv > 0:
+                    bs_candidates.setdefault(bk, set()).add(bv)
+
+        dot_m_blocks = set(ge_m_map.keys()) | set(tma_m_map.keys())
+        dot_n_blocks = set(ge_n_map.keys())
+        dot_k_blocks = set(ge_k_map.keys()) | set(tma_k_map.keys())
+        all_dot_blocks = dot_m_blocks | dot_n_blocks | dot_k_blocks
+
+        all_params = list(analyzer.input_params | analyzer.constexpr_params)
+        if keys:
+            for k in keys:
+                if k not in all_params:
+                    all_params.append(k)
+
+        specs: dict[str, KernelAxisSpec] = {}
+        all_dynamic_dims = set(dim_to_blocks.keys())
+
+        for pname in all_params:
+            low = pname.lower()
+            if (
+                pname in invariants
+                or _is_spatial_conv_param(pname)
+                or low in _INVARIANT_EXACT_NAMES
+                or low.startswith(("is_", "has_", "have_", "do_", "use_", "apply_", "swap_"))
+            ):
+                specs[pname] = KernelAxisSpec(name=pname, role=AxisRole.INVARIANT_CONST)
+                continue
+
+            if pname in dim_to_blocks:
+                blks = tuple(sorted(dim_to_blocks[pname]))
+                cands: set[int] = set()
+                for b in blks:
+                    cands.update(bs_candidates.get(b, ()))
+                feeds_dot = bool(set(blks) & all_dot_blocks) or (has_dot and bool(blks))
+                floor = min_load
+                if feeds_dot:
+                    if set(blks) & dot_k_blocks:
+                        floor = max(floor, min_k)
+                    elif set(blks) & dot_m_blocks:
+                        floor = max(floor, min_m)
+                    elif set(blks) & dot_n_blocks:
+                        floor = max(floor, min_n)
+                    else:
+                        floor = max(floor, min(min_m, min_n, min_k))
+                specs[pname] = KernelAxisSpec(
+                    name=pname,
+                    role=AxisRole.DYNAMIC_TILE_DIM,
+                    candidate_blocks=tuple(sorted(cands)),
+                    block_param_names=blks,
+                    min_block_size=floor,
+                    feeds_dot=feeds_dot,
+                )
+                continue
+
+            if pname in stride_params or _looks_like_memory_stride(pname):
+                p_dims: set[str] = set()
+                for base_p in stride_to_tensor_base.get(pname, ()):
+                    p_dims.update(tensor_base_to_dims.get(base_p, ()))
+                if not p_dims and all_dynamic_dims:
+                    p_dims.update(all_dynamic_dims)
+                sorted_pdims = tuple(sorted(p_dims))
+                specs[pname] = KernelAxisSpec(
+                    name=pname,
+                    role=AxisRole.DYNAMIC_STRIDE,
+                    paired_dims=sorted_pdims,
+                    paired_dim=sorted_pdims[0] if sorted_pdims else None,
+                )
+                continue
+
+            # Remaining non-constexpr scalar runtime args that appear in autotune `keys`
+            # (e.g. fixed-literal block kernels `key=["n_elements"]` or `key=["M"]`)
+            if keys and pname in keys and pname in analyzer.input_params:
+                all_cands: set[int] = set()
+                for s in bs_candidates.values():
+                    all_cands.update(s)
+                specs[pname] = KernelAxisSpec(
+                    name=pname,
+                    role=AxisRole.DYNAMIC_TILE_DIM,
+                    candidate_blocks=tuple(sorted(all_cands)),
+                    min_block_size=(min(min_m, min_n, min_k) if has_dot else min_load),
+                    feeds_dot=has_dot,
+                )
+
+        _axis_spec_cache[cache_key] = specs
+        return specs
+    except Exception as exc:
+        if knobs.autotuning.print:
+            print(f"Warning: infer_bucketable_axes failed: {exc}")
+        return {}
