@@ -41,6 +41,8 @@ from .shape_bucketing import (
     OnlineBucketPolicy,
     warmup_buckets,
 )
+from .shape_profiler import ProfileMode, ShapeProfiler
+from .bucket_guard import DecodeGraphBucketRunner, SymbolicBucketGuard, TokenBudgetBatcher
 
 __all__ = [
     "autotune",
@@ -69,4 +71,9 @@ __all__ = [
     "IntervalPolicy",
     "OnlineBucketPolicy",
     "warmup_buckets",
+    "ProfileMode",
+    "ShapeProfiler",
+    "SymbolicBucketGuard",
+    "DecodeGraphBucketRunner",
+    "TokenBudgetBatcher",
 ]
