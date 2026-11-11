@@ -39,11 +39,43 @@ from .adjust_kernel_param import auto_adjust_block_sizes
 from triton._C.libtriton import get_cache_invalidating_env_vars
 
 
+def _resolve_xpu_block_size_candidates():
+    try:
+        from ._xpu_autotune_candidates import block_size_candidates
+        return block_size_candidates
+    except ImportError:
+        return None
+
+
+def _default_num_stages() -> int:
+    import os
+    if os.environ.get("FLAGTREE_BACKEND") == "xpu" or _resolve_xpu_block_size_candidates() is not None:
+        return 2
+    return 3
+
+
+def _wallclock_bench_fallback(kernel_call) -> List[float]:
+    """Synchronized wall-clock fallback when device events return 0.0ms (e.g. XPU without KL3 event timers)."""
+    di = driver.active.get_device_interface()
+    for _ in range(2):
+        kernel_call()
+    di.synchronize()
+    samples = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        kernel_call()
+        di.synchronize()
+        samples.append((time.perf_counter() - t0) * 1e3)
+    samples.sort()
+    return [samples[2], samples[1], samples[3]]
+
+
 class Autotuner(KernelInterface):
 
     def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, pre_hook=None, post_hook=None,
                  prune_configs_by: Optional[Dict] = None, warmup=None, rep=None, use_cuda_graph=False, do_bench=None,
-                 cache_results=False, shape_policy=None):
+                 cache_results=False, shape_policy=None, generate_configs=None, op_affiliation="", row_sign="",
+                 col_sign="", n_elem_sign=""):
         """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
             'perf_model': performance model used to predicate running time with different configs, returns running time
@@ -52,10 +84,17 @@ class Autotuner(KernelInterface):
                 `prune_configs_by( configs: List[triton.Config], named_args: Dict[str, Any], **kwargs: Dict[str, Any]) -> List[triton.Config]:`
                 and return pruned configs. It should return at least one config.
         """
+        default_stages = 2 if generate_configs is not None else 3
         if not configs:
-            self.configs = [Config({}, num_warps=4, num_stages=3, num_ctas=1)]
+            self.configs = [Config({}, num_warps=4, num_stages=default_stages, num_ctas=1)]
         else:
             self.configs = configs
+        self.no_configs = (not configs)
+        self.generate_configs = generate_configs
+        self.op_affiliation = op_affiliation
+        self.row_sign = row_sign
+        self.col_sign = col_sign
+        self.n_elem_sign = n_elem_sign
         if self.configs and (len(self.configs) > 0):
             self.shared_config_pre_hook = self.configs[0].pre_hook  # flagtree aabs
         self.keys = key
@@ -212,16 +251,23 @@ class Autotuner(KernelInterface):
             return [float("inf"), float("inf"), float("inf")]
 
         timeout_sec = knobs.autotuning.compile_timeout_sec
+
+        def _invoke_bench():
+            try:
+                return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+            except ZeroDivisionError:
+                return _wallclock_bench_fallback(kernel_call)
+
         try:
             if timeout_sec is not None and timeout_sec > 0:
                 rett = run_with_compile_timeout(
-                    lambda: self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8)),
+                    _invoke_bench,
                     timeout_sec,
                     kernel_name=self.base_fn.__name__,
                     config_desc=cfg_sig,
                 )
             else:
-                rett = self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+                rett = _invoke_bench()
         # except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
         # flagtree tileir: prune backend compiler failures during autotuning.
         except (OutOfResources, CompileTimeAssertionFailure, PTXASError, BackendCompilerError, CompileTimeoutError) as e:
@@ -296,7 +342,8 @@ class Autotuner(KernelInterface):
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
         bucketing_enabled = (self.shape_policy is not None) or bool(knobs.autotuning.shape_bucketing)
-        if len(self.configs) > 1:
+        has_dynamic_cand_gen = self.no_configs and self.generate_configs is not None
+        if len(self.configs) > 1 or has_dynamic_cand_gen:
             all_args = {**self.nargs, **kwargs}
             _args = {k: v for (k, v) in all_args.items() if k in self.arg_names}
             raw_key = [_args[k] for k in self.keys if k in _args]
@@ -324,6 +371,24 @@ class Autotuner(KernelInterface):
             else:
                 key = raw_key
 
+            if has_dynamic_cand_gen and not (bucketing_enabled and key in self.cache):
+                cand_fn = _resolve_xpu_block_size_candidates()
+                if cand_fn is not None:
+                    cand_nargs = (
+                        {**self.nargs, **lookup.representative_dims}
+                        if (bucketing_enabled and lookup is not None)
+                        else self.nargs
+                    )
+                    cands = cand_fn(
+                        cand_nargs,
+                        self.generate_configs,
+                        self.op_affiliation,
+                        self.row_sign,
+                        self.col_sign,
+                        self.n_elem_sign,
+                    )
+                    self.configs = cands if cands else [Config({}, num_warps=4, num_stages=2, num_ctas=1)]
+
             guard_mismatch = False
             if bucketing_enabled and key in self.cache and self.early_config_prune is not None:
                 valid_cached = self.early_config_prune([self.cache[key]], self.nargs, **kwargs)
@@ -334,23 +399,26 @@ class Autotuner(KernelInterface):
                     )
 
             if key not in self.cache:
-                used_cached_result = False
-                pruned_configs = self.prune_configs(kwargs)
-
-                def benchmark():
-                    bench_start = time.time()
-                    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
-                    bench_end = time.time()
-                    self.bench_time = bench_end - bench_start
-                    self.cache[key] = builtins.min(timings, key=timings.get)
-                    full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
-                    self.pre_hook(full_nargs, reset_only=True)
-                    self.configs_timings = timings
-
-                if self.cache_results:
-                    used_cached_result = self.check_disk_cache(key, pruned_configs, benchmark)
+                if len(self.configs) <= 1:
+                    self.cache[key] = self.configs[0]
                 else:
-                    benchmark()
+                    used_cached_result = False
+                    pruned_configs = self.prune_configs(kwargs)
+
+                    def benchmark():
+                        bench_start = time.time()
+                        timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                        bench_end = time.time()
+                        self.bench_time = bench_end - bench_start
+                        self.cache[key] = builtins.min(timings, key=timings.get)
+                        full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
+                        self.pre_hook(full_nargs, reset_only=True)
+                        self.configs_timings = timings
+
+                    if self.cache_results:
+                        used_cached_result = self.check_disk_cache(key, pruned_configs, benchmark)
+                    else:
+                        benchmark()
 
             config = self.cache[key]
             if bucketing_enabled and lookup is not None:
@@ -458,11 +526,11 @@ class Config:
     :ivar ir_override: filename of a user-defined IR (*.{ttgir|llir|ptx|amdgcn}).
     """
 
-    def __init__(self, kwargs, num_warps=4, num_stages=3, num_ctas=1, maxnreg=None, pre_hook=None, ir_override=None):
+    def __init__(self, kwargs, num_warps=4, num_stages=None, num_ctas=1, maxnreg=None, pre_hook=None, ir_override=None):
         self.kwargs = kwargs
         self.num_warps = num_warps
         self.num_ctas = num_ctas
-        self.num_stages = num_stages
+        self.num_stages = _default_num_stages() if num_stages is None else num_stages
         self.maxnreg = maxnreg
         self.pre_hook = pre_hook
         self.ir_override = ir_override
@@ -470,7 +538,7 @@ class Config:
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
         self.num_warps = state.get("num_warps", 4)
-        self.num_stages = state.get("num_stages", 3)
+        self.num_stages = state.get("num_stages", _default_num_stages())
         self.num_ctas = state.get("num_ctas", 1)
         self.maxnreg = state.get("maxnreg", None)
         self.pre_hook = state.get("pre_hook", None)
@@ -516,7 +584,8 @@ class Config:
 
 
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
-             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False, shape_policy=None):
+             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False, shape_policy=None,
+             generate_configs=None, op_affiliation="sdnn", row_sign=None, col_sign=None, n_elem_sign=None):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -580,7 +649,9 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
         return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                          post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
                          use_cuda_graph=use_cuda_graph, do_bench=do_bench, cache_results=cache_results,
-                         shape_policy=shape_policy)
+                         shape_policy=shape_policy, generate_configs=generate_configs,
+                         op_affiliation=op_affiliation or "", row_sign=row_sign or "",
+                         col_sign=col_sign or "", n_elem_sign=n_elem_sign or "")
 
     return decorator
 
