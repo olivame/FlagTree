@@ -54,20 +54,23 @@ def _default_num_stages() -> int:
     return 3
 
 
+_EVENT_TIMER_ZERO_DIV: bool = False
+
+
 def _wallclock_bench_fallback(kernel_call) -> List[float]:
     """Synchronized wall-clock fallback when device events return 0.0ms (e.g. XPU without KL3 event timers)."""
     di = driver.active.get_device_interface()
-    for _ in range(2):
-        kernel_call()
+    kernel_call()
     di.synchronize()
     samples = []
-    for _ in range(5):
+    for _ in range(3):
         t0 = time.perf_counter()
-        kernel_call()
+        for _ in range(8):
+            kernel_call()
         di.synchronize()
-        samples.append((time.perf_counter() - t0) * 1e3)
+        samples.append(((time.perf_counter() - t0) * 1e3) / 8.0)
     samples.sort()
-    return [samples[2], samples[1], samples[3]]
+    return [samples[1], samples[0], samples[2]]
 
 
 class Autotuner(KernelInterface):
@@ -253,9 +256,14 @@ class Autotuner(KernelInterface):
         timeout_sec = knobs.autotuning.compile_timeout_sec
 
         def _invoke_bench():
+            global _EVENT_TIMER_ZERO_DIV
+            if _EVENT_TIMER_ZERO_DIV and self._do_bench is None:
+                return _wallclock_bench_fallback(kernel_call)
             try:
                 return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
             except ZeroDivisionError:
+                if self._do_bench is None:
+                    _EVENT_TIMER_ZERO_DIV = True
                 return _wallclock_bench_fallback(kernel_call)
 
         try:
@@ -270,7 +278,36 @@ class Autotuner(KernelInterface):
                 rett = _invoke_bench()
         # except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
         # flagtree tileir: prune backend compiler failures during autotuning.
-        except (OutOfResources, CompileTimeAssertionFailure, PTXASError, BackendCompilerError, CompileTimeoutError) as e:
+        except (
+            OutOfResources,
+            CompileTimeAssertionFailure,
+            PTXASError,
+            BackendCompilerError,
+            CompileTimeoutError,
+            RuntimeError,
+        ) as e:
+            if isinstance(e, RuntimeError) and not isinstance(
+                e,
+                (
+                    OutOfResources,
+                    CompileTimeAssertionFailure,
+                    PTXASError,
+                    BackendCompilerError,
+                    CompileTimeoutError,
+                ),
+            ):
+                err_msg = str(e)
+                if not any(
+                    marker in err_msg
+                    for marker in (
+                        "PassManager::run failed",
+                        "out of resource",
+                        "OutOfResources",
+                        "shared memory",
+                        "exceed",
+                    )
+                ):
+                    raise
             if isinstance(e, (BackendCompilerError, CompileTimeoutError)):
                 GLOBAL_COMPILE_BLACKLIST.add(self.base_fn.__name__, cfg_sig, str(e))
             if isinstance(e, CompileTimeoutError):
@@ -387,6 +424,15 @@ class Autotuner(KernelInterface):
                         self.col_sign,
                         self.n_elem_sign,
                     )
+                    import os as _os
+                    _max_cands = _os.environ.get("FLAGTREE_MAX_AUTOTUNE_CANDIDATES")
+                    if _max_cands is not None and cands and int(_max_cands) > 0 and len(cands) > int(_max_cands):
+                        _k = int(_max_cands)
+                        if _k == 1:
+                            cands = [cands[0]]
+                        else:
+                            _idxs = [round(i * (len(cands) - 1) / (_k - 1)) for i in range(_k)]
+                            cands = [cands[idx] for idx in dict.fromkeys(_idxs)]
                     self.configs = cands if cands else [Config({}, num_warps=4, num_stages=2, num_ctas=1)]
 
             guard_mismatch = False
