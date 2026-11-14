@@ -534,6 +534,19 @@ class Autotuner(KernelInterface):
                     for config in pruned_configs
                 }
                 pruned_configs = sorted(est_timing.keys(), key=lambda x: est_timing[x])[:top_k]
+        import os as _os
+        _max_cands = _os.environ.get("FLAGTREE_MAX_AUTOTUNE_CANDIDATES")
+        if _max_cands is not None and pruned_configs:
+            try:
+                _k = int(_max_cands)
+            except ValueError:
+                _k = 0
+            if _k > 0 and len(pruned_configs) > _k:
+                if _k == 1:
+                    pruned_configs = [pruned_configs[0]]
+                else:
+                    _idxs = [round(i * (len(pruned_configs) - 1) / (_k - 1)) for i in range(_k)]
+                    pruned_configs = [pruned_configs[idx] for idx in dict.fromkeys(_idxs)]
         return pruned_configs
 
     def warmup(self, *args, **kwargs):
