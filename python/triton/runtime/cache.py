@@ -22,6 +22,7 @@
 
 import json
 import os
+import shutil
 import uuid
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
@@ -31,6 +32,88 @@ import functools
 import sysconfig
 
 from triton import __version__, knobs
+
+
+
+
+def enforce_binary_cache_budget(
+    cache_root: Optional[str],
+    *,
+    max_entries: Optional[int] = None,
+    max_bytes: Optional[int] = None,
+    protect_key: Optional[str] = None,
+) -> int:
+    """Evict oldest cache-key directories (including .hgbin/.cubin/.xpubin/.ttir/.json)
+    when directory count or total size exceeds configured budget.
+
+    Never removes ``protect_key`` or active ``tmp.*`` staging directories.
+    """
+    if not cache_root or not os.path.isdir(cache_root):
+        return 0
+    lim_entries = int(max_entries) if (max_entries is not None and int(max_entries) > 0) else None
+    lim_bytes = int(max_bytes) if (max_bytes is not None and int(max_bytes) > 0) else None
+    if lim_entries is None and lim_bytes is None:
+        return 0
+
+    candidates = []
+    total_size = 0
+    try:
+        with os.scandir(cache_root) as it:
+            for entry in it:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                name = entry.name
+                if name.startswith("tmp."):
+                    continue
+                dir_size = 0
+                latest_mtime = 0.0
+                try:
+                    st_dir = entry.stat(follow_symlinks=False)
+                    latest_mtime = st_dir.st_mtime
+                    for root_d, _dirs, files in os.walk(entry.path):
+                        for fn in files:
+                            fp = os.path.join(root_d, fn)
+                            try:
+                                st = os.stat(fp)
+                                dir_size += st.st_size
+                                if st.st_mtime > latest_mtime:
+                                    latest_mtime = st.st_mtime
+                            except OSError:
+                                continue
+                except OSError:
+                    continue
+                total_size += dir_size
+                if name != protect_key:
+                    candidates.append((latest_mtime, dir_size, entry.path))
+    except OSError:
+        return 0
+
+    total_dirs = len(candidates) + (1 if protect_key and os.path.isdir(os.path.join(cache_root, protect_key)) else 0)
+    if (lim_entries is None or total_dirs <= lim_entries) and (lim_bytes is None or total_size <= lim_bytes):
+        return 0
+
+    candidates.sort(key=lambda item: item[0])
+    evicted = 0
+    for _mtime, dsize, dpath in candidates:
+        need_entries = lim_entries is not None and total_dirs > lim_entries
+        need_bytes = lim_bytes is not None and total_size > lim_bytes
+        if not (need_entries or need_bytes):
+            break
+        try:
+            shutil.rmtree(dpath, ignore_errors=False)
+            evicted += 1
+            total_dirs -= 1
+            total_size = max(0, total_size - dsize)
+        except OSError:
+            continue
+
+    if evicted:
+        try:
+            from .shape_bucketing import GLOBAL_BUCKET_TELEMETRY
+            GLOBAL_BUCKET_TELEMETRY.record_eviction(evicted)
+        except Exception:
+            pass
+    return evicted
 
 
 class CacheManager(ABC):
@@ -60,6 +143,8 @@ class FileCacheManager(CacheManager):
     def __init__(self, key, override=False, dump=False):
         self.key = key
         self.lock_path = None
+        self._override = bool(override)
+        self._dump = bool(dump)
         if dump:
             self.cache_dir = knobs.cache.dump_dir
             self.cache_dir = os.path.join(self.cache_dir, self.key)
@@ -110,12 +195,29 @@ class FileCacheManager(CacheManager):
         return result
 
     # Note a group of pushed files as being part of a group
+    def _maybe_enforce_disk_budget(self) -> None:
+        if self._override or self._dump:
+            return
+        max_entries = knobs.cache.max_cache_entries
+        if max_entries is None:
+            max_entries = getattr(knobs.autotuning, "max_bucket_artifacts", None)
+        max_bytes = knobs.cache.max_cache_bytes
+        if max_entries is not None or max_bytes is not None:
+            enforce_binary_cache_budget(
+                knobs.cache.dir,
+                max_entries=max_entries,
+                max_bytes=max_bytes,
+                protect_key=self.key,
+            )
+
     def put_group(self, filename: str, group: Dict[str, str]) -> str:
         if not self.cache_dir:
             raise RuntimeError("Could not create or locate cache dir")
         grp_contents = json.dumps({"child_paths": group})
         grp_filename = f"__grp__{filename}"
-        return self.put(grp_contents, grp_filename, binary=False)
+        out = self.put(grp_contents, grp_filename, binary=False)
+        self._maybe_enforce_disk_budget()
+        return out
 
     def put(self, data, filename, binary=True) -> str:
         if not self.cache_dir:

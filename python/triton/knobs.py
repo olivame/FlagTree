@@ -427,6 +427,8 @@ cache: cache_knobs
 
 
 class cache_knobs(base_knobs):
+    max_cache_entries: env_opt_int = env_opt_int("FLAGTREE_MAX_CACHE_ENTRIES")
+    max_cache_bytes: env_opt_int = env_opt_int("FLAGTREE_MAX_CACHE_BYTES")
     home_dir: env_str = env_str("TRITON_HOME", os.path.expanduser("~/"))
 
     dump_dir = env_str_callable_default("TRITON_DUMP_DIR", lambda: cache.get_triton_dir("dump"))

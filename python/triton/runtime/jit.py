@@ -39,6 +39,10 @@ from types import ModuleType
 from .. import knobs
 from flagtree import _flagprism  # FlagPrism
 from .driver import driver
+from .backend_caps import (
+    get_backend_capabilities as _get_backend_capabilities,
+    strip_int_alignment_spec as _strip_int_alignment_spec,
+)
 from . import _async_compile
 from .._utils import find_paths_if, get_iterable_path, type_canonicalisation_dict, is_namedtuple
 from .cache import get_cache_key
@@ -595,6 +599,26 @@ class JITCallable:
     src = property(fget=_get_src, fset=_set_src)
 
 
+def _jit_bkt_ceil(value: int) -> int:
+    """Fast O(1) bucket ceiling matching shape_bucketing ladders."""
+    if value <= 0:
+        return value
+    if value <= 1:
+        return 1
+    if value <= 64:
+        for step in (2, 4, 8, 16, 24, 32, 48, 64):
+            if value <= step:
+                return step
+        return 64
+    pow2_lo = 1 << (value.bit_length() - 1)
+    if pow2_lo == value:
+        return value
+    half_step = pow2_lo + (pow2_lo >> 1)
+    if value <= half_step:
+        return half_step
+    return 1 << value.bit_length()
+
+
 @dataclass
 class JitFunctionInfo:
     module: ModuleType
@@ -704,7 +728,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         from ..compiler import CompiledKernel, compile, ASTSource, make_backend
         from ..backends import route_target
         target = driver.active.get_current_target()
-        target = route_target(target, self)
+        target = route_target(target, self)  # flagtree tileir: support target routing
         backend = make_backend(target)
         self.CompiledKernel = CompiledKernel
         self.compile = compile
@@ -754,6 +778,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # specialization is list[tuple[str, Any]], where first element of tuple is
         # the type and the second parameter is the 'specialization' value.
         bound_args, specialization, options = binder(*args, **kwargs)
+        if getattr(knobs.autotuning, "shape_bucketing", False):
+            specialization = self._normalize_specialization_for_bucketing(bound_args, specialization)
 
         key = compute_cache_key(kernel_key_cache, specialization, options)
         kernel = kernel_cache.get(key, None)
@@ -837,6 +863,64 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
         # Hooks that will be called prior to executing "run"
         self.pre_run_hooks = []
+        # Shape-bucketing runtime tracker for dynamic scalar int alignment,
+        # scoped by (arg_idx, bucket_hi) so a dynamic axis in one bucket never
+        # strips alignment from a static axis (e.g. head_dim=64) in another.
+        self._bkt_unaligned_int_buckets = set()
+
+    def _normalize_specialization_for_bucketing(self, bound_args, specialization):
+        """Strip backend divisibility specialization on scalar int args once an
+        unaligned value has been observed (or premarked) for that (arg_idx, bucket_hi).
+
+        Uses ``backend_caps.strip_int_alignment_spec`` rather than hardcoding backend
+        alignment tags, while preserving pointer alignment, constexprs, and static dims.
+        """
+        tags = getattr(self, "_bkt_align_tags", None)
+        if tags is None:
+            caps = _get_backend_capabilities()
+            tags = caps.alignment_spec_tags
+            self._bkt_align_tags = tags
+            self._bkt_caps = caps
+        unaligned = self._bkt_unaligned_int_buckets
+        eager_indices = getattr(self, "_bkt_eager_unaligned_indices", None)
+        changed = False
+        out = None
+        if tags == ("D",):
+            idx = 0
+            for val in bound_args.values():
+                if type(val) is int:
+                    spec = specialization[idx]
+                    if type(spec) is tuple and len(spec) == 2:
+                        ty, sp = spec
+                        if (ty == "i32" or ty == "i64" or ty == "u32" or ty == "u64") and type(sp) is str:
+                            if sp == "":
+                                unaligned.add((idx, _jit_bkt_ceil(val)))
+                            elif sp == "D" or "D" in sp:
+                                if (unaligned and (idx, _jit_bkt_ceil(val)) in unaligned) or (
+                                    eager_indices and idx in eager_indices
+                                ):
+                                    if out is None:
+                                        out = list(specialization)
+                                    out[idx] = (ty, "" if sp == "D" else sp.replace("D", ""))
+                                    changed = True
+                idx += 1
+            return out if changed else specialization
+        caps = self._bkt_caps
+
+        for idx, (val, spec) in enumerate(zip(bound_args.values(), specialization)):
+            if type(val) is int:
+                norm_spec, was_aligned, is_unaligned_int = _strip_int_alignment_spec(spec, caps)
+                if is_unaligned_int:
+                    unaligned.add((idx, _jit_bkt_ceil(val)))
+                elif was_aligned and (
+                    (unaligned and (idx, _jit_bkt_ceil(val)) in unaligned)
+                    or (eager_indices and idx in eager_indices)
+                ):
+                    if out is None:
+                        out = list(specialization)
+                    out[idx] = norm_spec
+                    changed = True
+        return out if changed else specialization
 
     def preload(self, specialization_data):
         import json

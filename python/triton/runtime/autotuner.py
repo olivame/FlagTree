@@ -33,17 +33,52 @@ from typing import Dict, Tuple, List, Optional
 from .. import knobs
 from .jit import KernelInterface, JITFunction
 from .errors import BackendCompilerError, OutOfResources, PTXASError, AutotunerError
+try:
+    from .errors import CompileTimeoutError
+except ImportError:
+    class CompileTimeoutError(RuntimeError):
+        pass
 from .driver import driver
 from .cache import get_cache_manager, triton_key
 from .adjust_kernel_param import auto_adjust_block_sizes
 from triton._C.libtriton import get_cache_invalidating_env_vars
 
 
+def _resolve_xpu_block_size_candidates():
+    from .backend_caps import resolve_candidate_generator
+    return resolve_candidate_generator()
+
+
+def _default_num_stages() -> int:
+    from .backend_caps import get_backend_capabilities
+    return get_backend_capabilities().default_num_stages
+
+
+_EVENT_TIMER_ZERO_DIV: bool = False
+
+
+def _wallclock_bench_fallback(kernel_call) -> List[float]:
+    """Synchronized wall-clock fallback when device events return 0.0ms (e.g. XPU without KL3 event timers)."""
+    di = driver.active.get_device_interface()
+    kernel_call()
+    di.synchronize()
+    samples = []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        for _ in range(8):
+            kernel_call()
+        di.synchronize()
+        samples.append(((time.perf_counter() - t0) * 1e3) / 8.0)
+    samples.sort()
+    return [samples[1], samples[0], samples[2]]
+
+
 class Autotuner(KernelInterface):
 
     def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, pre_hook=None, post_hook=None,
                  prune_configs_by: Optional[Dict] = None, warmup=None, rep=None, use_cuda_graph=False, do_bench=None,
-                 cache_results=False):
+                 cache_results=False, shape_policy=None, generate_configs=None, op_affiliation="", row_sign="",
+                 col_sign="", n_elem_sign=""):
         """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
             'perf_model': performance model used to predicate running time with different configs, returns running time
@@ -52,10 +87,17 @@ class Autotuner(KernelInterface):
                 `prune_configs_by( configs: List[triton.Config], named_args: Dict[str, Any], **kwargs: Dict[str, Any]) -> List[triton.Config]:`
                 and return pruned configs. It should return at least one config.
         """
+        default_stages = 2 if generate_configs is not None else 3
         if not configs:
-            self.configs = [Config({}, num_warps=4, num_stages=3, num_ctas=1)]
+            self.configs = [Config({}, num_warps=4, num_stages=default_stages, num_ctas=1)]
         else:
             self.configs = configs
+        self.no_configs = (not configs)
+        self.generate_configs = generate_configs
+        self.op_affiliation = op_affiliation
+        self.row_sign = row_sign
+        self.col_sign = col_sign
+        self.n_elem_sign = n_elem_sign
         if self.configs and (len(self.configs) > 0):
             self.shared_config_pre_hook = self.configs[0].pre_hook  # flagtree aabs
         self.keys = key
@@ -119,6 +161,9 @@ class Autotuner(KernelInterface):
         self.num_reps = rep
         self.use_cuda_graph = use_cuda_graph
         self.seen_tuned_metas = {}  # flagtree aabs: deduplicate tuned meta
+        self.shape_policy = shape_policy
+        self._bucket_budget = None
+        self.last_dispatch_result = None
 
         # If we got explicitly called via the old interface, raise a warning
         # and proceed with the old behavior.
@@ -204,9 +249,105 @@ class Autotuner(KernelInterface):
             self.post_hook(full_nargs, exception=None)
 
         try:
-            rett = self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+            from ._async_compile import GLOBAL_COMPILE_BLACKLIST, run_with_compile_timeout
+        except ImportError:
+            GLOBAL_COMPILE_BLACKLIST = None
+            run_with_compile_timeout = None
+        cfg_sig = str(config)
+        if GLOBAL_COMPILE_BLACKLIST is not None and GLOBAL_COMPILE_BLACKLIST.is_blacklisted(self.base_fn.__name__, cfg_sig):
+            return [float("inf"), float("inf"), float("inf")]
+
+        timeout_sec = getattr(knobs.autotuning, "compile_timeout_sec", None)
+
+        def _invoke_bench():
+            global _EVENT_TIMER_ZERO_DIV
+            if _EVENT_TIMER_ZERO_DIV and self._do_bench is None:
+                return _wallclock_bench_fallback(kernel_call)
+            try:
+                return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+            except ZeroDivisionError:
+                if self._do_bench is None:
+                    _EVENT_TIMER_ZERO_DIV = True
+                return _wallclock_bench_fallback(kernel_call)
+
+        try:
+            if run_with_compile_timeout is not None and timeout_sec is not None and timeout_sec > 0:
+                rett = run_with_compile_timeout(
+                    _invoke_bench,
+                    timeout_sec,
+                    kernel_name=self.base_fn.__name__,
+                    config_desc=cfg_sig,
+                )
+            else:
+                rett = _invoke_bench()
+        # except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
         # flagtree tileir: prune backend compiler failures during autotuning.
-        except (OutOfResources, CompileTimeAssertionFailure, PTXASError, BackendCompilerError) as e:
+        except (
+            OutOfResources,
+            CompileTimeAssertionFailure,
+            PTXASError,
+            BackendCompilerError,
+            CompileTimeoutError,
+            RuntimeError,
+        ) as e:
+            if isinstance(e, RuntimeError) and not isinstance(
+                e,
+                (
+                    OutOfResources,
+                    CompileTimeAssertionFailure,
+                    PTXASError,
+                    BackendCompilerError,
+                    CompileTimeoutError,
+                ),
+            ):
+                err_msg = str(e)
+                if not any(
+                    marker in err_msg
+                    for marker in (
+                        "PassManager::run failed",
+                        "out of resource",
+                        "OutOfResources",
+                        "out of memory",
+                        "OutOfMemory",
+                        "shared memory",
+                        "exceed",
+                    )
+                ):
+                    raise
+            if isinstance(e, (BackendCompilerError, CompileTimeoutError)):
+                GLOBAL_COMPILE_BLACKLIST.add(self.base_fn.__name__, cfg_sig, str(e))
+            if isinstance(e, CompileTimeoutError):
+                from ._distributed import GLOBAL_FALLBACK_REGISTRY, PerfRiskLevel
+                GLOBAL_FALLBACK_REGISTRY.record(
+                    self.base_fn.__name__,
+                    "autotune",
+                    (),
+                    (),
+                    reason=str(e),
+                    recovery_action="blacklist_config_and_select_next_candidate",
+                    perf_risk_level=PerfRiskLevel.LOW,
+                )
+            elif getattr(knobs.autotuning, "oom_recovery", False):
+                from ._distributed import GLOBAL_FALLBACK_REGISTRY, PerfRiskLevel, _is_oom_exception
+                if _is_oom_exception(e):
+                    try:
+                        import torch
+                        from .backend_caps import resolve_collective_device
+                        dev_name = resolve_collective_device()
+                        dev_mod = getattr(torch, dev_name, None)
+                        if dev_mod is not None and hasattr(dev_mod, "empty_cache"):
+                            dev_mod.empty_cache()
+                    except Exception:
+                        pass
+                    GLOBAL_FALLBACK_REGISTRY.record(
+                        self.base_fn.__name__,
+                        "autotune",
+                        (),
+                        (cfg_sig,),
+                        reason=f"{type(e).__name__}: {e}",
+                        recovery_action="release_cache_and_prune_oom_config",
+                        perf_risk_level=PerfRiskLevel.MEDIUM,
+                    )
             if verbose:
                 print(f"Autotuning failed with {e}")
             rett = [float("inf"), float("inf"), float("inf")]
@@ -254,40 +395,143 @@ class Autotuner(KernelInterface):
                 "configs_timings":
                 [(config.__dict__, timings) for config, timings in self.configs_timings.items() if not config.pre_hook],
             }), file_name, binary=False)
+        max_artifacts = knobs.autotuning.max_bucket_artifacts
+        if max_artifacts is not None and max_artifacts > 0:
+            from .shape_bucketing import enforce_disk_cache_budget
+            enforce_disk_cache_budget(knobs.cache.dir, max_artifacts)
         return False
 
     def run(self, *args, **kwargs):
         self.seen_tuned_metas = {}  # flagtree aabs: deduplicate tuned meta
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
-        if len(self.configs) > 1:
+        bucketing_enabled = (self.shape_policy is not None) or bool(knobs.autotuning.shape_bucketing)
+        has_dynamic_cand_gen = self.no_configs and self.generate_configs is not None
+        if len(self.configs) > 1 or has_dynamic_cand_gen:
             all_args = {**self.nargs, **kwargs}
             _args = {k: v for (k, v) in all_args.items() if k in self.arg_names}
-            key = [_args[key] for key in self.keys if key in _args]
-            for _, arg in _args.items():
-                if hasattr(arg, "dtype"):
-                    key.append(str(arg.dtype))
-            key = tuple(key)
+            raw_key = [_args[k] for k in self.keys if k in _args]
+            extra_dtypes = [str(arg.dtype) for _, arg in _args.items() if hasattr(arg, "dtype")]
+            raw_key.extend(extra_dtypes)
+            raw_key = tuple(raw_key)
+
+            lookup = None
+            if bucketing_enabled:
+                from .shape_bucketing import (
+                    BucketCacheBudget,
+                    BucketLookupResult,
+                    DispatchStatus,
+                    GLOBAL_BUCKET_TELEMETRY,
+                    resolve_tuner_policy,
+                )
+                policy = resolve_tuner_policy(
+                    self,
+                    explicit_policy=self.shape_policy,
+                    policy_path=knobs.autotuning.shape_policy_path,
+                    mode_str=knobs.autotuning.shape_bucketing_mode,
+                )
+                lookup = policy.lookup_autotune_key(_args, self.keys, extra_dtypes=extra_dtypes)
+                key = lookup.bucket_key
+            else:
+                key = raw_key
+
+            if has_dynamic_cand_gen and not (bucketing_enabled and key in self.cache):
+                cand_fn = _resolve_xpu_block_size_candidates()
+                if cand_fn is not None:
+                    cand_nargs = (
+                        {**self.nargs, **lookup.representative_dims}
+                        if (bucketing_enabled and lookup is not None)
+                        else self.nargs
+                    )
+                    cands = cand_fn(
+                        cand_nargs,
+                        self.generate_configs,
+                        self.op_affiliation,
+                        self.row_sign,
+                        self.col_sign,
+                        self.n_elem_sign,
+                    )
+                    import os as _os
+                    _max_cands = _os.environ.get("FLAGTREE_MAX_AUTOTUNE_CANDIDATES")
+                    if _max_cands is not None and cands and int(_max_cands) > 0 and len(cands) > int(_max_cands):
+                        _k = int(_max_cands)
+                        if _k == 1:
+                            cands = [cands[0]]
+                        else:
+                            _idxs = [round(i * (len(cands) - 1) / (_k - 1)) for i in range(_k)]
+                            cands = [cands[idx] for idx in dict.fromkeys(_idxs)]
+                    self.configs = cands if cands else [Config({}, num_warps=4, num_stages=2, num_ctas=1)]
+
+            guard_mismatch = False
+            if bucketing_enabled and key in self.cache and self.early_config_prune is not None:
+                prune_nargs = {**self.nargs, **{k: v for k, v in kwargs.items() if k in self.arg_names}}
+                valid_cached = self.early_config_prune([self.cache[key]], prune_nargs, **kwargs)
+                if not valid_cached:
+                    guard_mismatch = True
+                    key = key + ("guard_override",) + tuple(
+                        _args[k] for k in self.keys if k in _args and isinstance(_args[k], (int, str, float, bool))
+                    )
+
+            _dist_guard = None
+            _dist_decision = None
+            if getattr(knobs.autotuning, "distributed_dispatch_guard", False):
+                from ._distributed import RankDispatchState, get_default_dispatch_guard
+                _dist_guard = getattr(self, "dispatch_guard", None) or get_default_dispatch_guard()
+                if _dist_guard is not None:
+                    _local_state = (
+                        RankDispatchState.ANY_COLD_COMPILE
+                        if key not in self.cache
+                        else RankDispatchState.ALL_HOT_HIT
+                    )
+                    _dist_decision = _dist_guard.negotiate(_local_state)
+
             if key not in self.cache:
-                used_cached_result = False
-                pruned_configs = self.prune_configs(kwargs)
-
-                def benchmark():
-                    bench_start = time.time()
-                    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
-                    bench_end = time.time()
-                    self.bench_time = bench_end - bench_start
-                    self.cache[key] = builtins.min(timings, key=timings.get)
-                    full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
-                    self.pre_hook(full_nargs, reset_only=True)
-                    self.configs_timings = timings
-
-                if self.cache_results:
-                    used_cached_result = self.check_disk_cache(key, pruned_configs, benchmark)
+                if len(self.configs) <= 1:
+                    self.cache[key] = self.configs[0]
                 else:
-                    benchmark()
+                    used_cached_result = False
+                    pruned_configs = self.prune_configs(kwargs)
+
+                    def benchmark():
+                        bench_start = time.time()
+                        timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                        bench_end = time.time()
+                        self.bench_time = bench_end - bench_start
+                        self.cache[key] = builtins.min(timings, key=timings.get)
+                        full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
+                        self.pre_hook(full_nargs, reset_only=True)
+                        self.configs_timings = timings
+
+                    if self.cache_results:
+                        used_cached_result = self.check_disk_cache(key, pruned_configs, benchmark)
+                    else:
+                        benchmark()
+            if _dist_guard is not None and _dist_decision is not None:
+                _dist_guard.post_compile_sync(_dist_decision)
 
             config = self.cache[key]
+            if bucketing_enabled and lookup is not None:
+                if guard_mismatch:
+                    eff_status = DispatchStatus.GUARD_MISMATCH
+                elif lookup.status in (DispatchStatus.UNDERFLOW, DispatchStatus.OVERFLOW, DispatchStatus.GUARD_MISMATCH):
+                    eff_status = lookup.status
+                elif not used_cached_result:
+                    eff_status = DispatchStatus.COLD_TUNED
+                else:
+                    eff_status = DispatchStatus.HIT
+                self.last_dispatch_result = BucketLookupResult(
+                    bucket_key=key,
+                    status=eff_status,
+                    representative_dims=lookup.representative_dims,
+                    raw_dims=lookup.raw_dims,
+                    clamped_axes=lookup.clamped_axes,
+                )
+                GLOBAL_BUCKET_TELEMETRY.record(self.base_fn.__name__, eff_status, raw_key, key)
+                max_artifacts = knobs.autotuning.max_bucket_artifacts
+                if max_artifacts is not None and max_artifacts > 0:
+                    if self._bucket_budget is None:
+                        self._bucket_budget = BucketCacheBudget(max_artifacts)
+                    self._bucket_budget.touch_and_evict(self.cache, key, max_entries=max_artifacts)
         else:
             config = self.configs[0]
         self.best_config = config
@@ -311,7 +555,8 @@ class Autotuner(KernelInterface):
         pruned_configs = copy.deepcopy(self.configs)
         # pruned_configs = self.configs
         if self.early_config_prune:
-            pruned_configs = self.early_config_prune(pruned_configs, self.nargs, **kwargs)
+            prune_nargs = {**self.nargs, **{k: v for k, v in kwargs.items() if k in self.arg_names}}
+            pruned_configs = self.early_config_prune(pruned_configs, prune_nargs, **kwargs)
             if not pruned_configs:
                 raise AutotunerError(
                     "No valid autotuner configs after pruning. `early_config_prune` should return at least one config.")
@@ -333,6 +578,19 @@ class Autotuner(KernelInterface):
                     for config in pruned_configs
                 }
                 pruned_configs = sorted(est_timing.keys(), key=lambda x: est_timing[x])[:top_k]
+        import os as _os
+        _max_cands = _os.environ.get("FLAGTREE_MAX_AUTOTUNE_CANDIDATES")
+        if _max_cands is not None and pruned_configs:
+            try:
+                _k = int(_max_cands)
+            except ValueError:
+                _k = 0
+            if _k > 0 and len(pruned_configs) > _k:
+                if _k == 1:
+                    pruned_configs = [pruned_configs[0]]
+                else:
+                    _idxs = [round(i * (len(pruned_configs) - 1) / (_k - 1)) for i in range(_k)]
+                    pruned_configs = [pruned_configs[idx] for idx in dict.fromkeys(_idxs)]
         return pruned_configs
 
     def warmup(self, *args, **kwargs):
@@ -371,11 +629,11 @@ class Config:
     :ivar ir_override: filename of a user-defined IR (*.{ttgir|llir|ptx|amdgcn}).
     """
 
-    def __init__(self, kwargs, num_warps=4, num_stages=3, num_ctas=1, maxnreg=None, pre_hook=None, ir_override=None):
+    def __init__(self, kwargs, num_warps=4, num_stages=None, num_ctas=1, maxnreg=None, pre_hook=None, ir_override=None):
         self.kwargs = kwargs
         self.num_warps = num_warps
         self.num_ctas = num_ctas
-        self.num_stages = num_stages
+        self.num_stages = _default_num_stages() if num_stages is None else num_stages
         self.maxnreg = maxnreg
         self.pre_hook = pre_hook
         self.ir_override = ir_override
@@ -383,7 +641,7 @@ class Config:
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
         self.num_warps = state.get("num_warps", 4)
-        self.num_stages = state.get("num_stages", 3)
+        self.num_stages = state.get("num_stages", _default_num_stages())
         self.num_ctas = state.get("num_ctas", 1)
         self.maxnreg = state.get("maxnreg", None)
         self.pre_hook = state.get("pre_hook", None)
@@ -429,7 +687,8 @@ class Config:
 
 
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
-             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False):
+             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False, shape_policy=None,
+             generate_configs=None, op_affiliation="sdnn", row_sign=None, col_sign=None, n_elem_sign=None):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -492,7 +751,10 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     def decorator(fn):
         return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                          post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
-                         use_cuda_graph=use_cuda_graph, do_bench=do_bench, cache_results=cache_results)
+                         use_cuda_graph=use_cuda_graph, do_bench=do_bench, cache_results=cache_results,
+                         shape_policy=shape_policy, generate_configs=generate_configs,
+                         op_affiliation=op_affiliation or "", row_sign=row_sign or "",
+                         col_sign=col_sign or "", n_elem_sign=n_elem_sign or "")
 
     return decorator
 
@@ -505,8 +767,21 @@ class Heuristics(KernelInterface):
         self.arg_names = arg_names
 
     def run(self, *args, **kwargs):
-        for v, heur in self.values.items():
-            kwargs[v] = heur({**dict(zip(self.arg_names, args)), **kwargs})
+        env = {**dict(zip(self.arg_names, args)), **kwargs}
+        if getattr(knobs.autotuning, "shape_bucketing", False):
+            from .shape_bucketing import OnlineBucketPolicy, evaluate_heuristics_for_bucketing
+            policy = getattr(self, "_ft_bucket_policy", None)
+            if policy is None:
+                policy = OnlineBucketPolicy(op_name=getattr(self.fn, "__name__", "heur"))
+                self._ft_bucket_policy = policy
+            policy.observe_args(env)
+            evaluated = evaluate_heuristics_for_bucketing(self.values, env, policy)
+            kwargs.update(evaluated)
+        else:
+            for v, heur in self.values.items():
+                val = heur(env)
+                kwargs[v] = val
+                env[v] = val
         return self.fn.run(*args, **kwargs)
 
 

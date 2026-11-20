@@ -31,6 +31,7 @@ from .driver import driver
 from .jit import JITFunction, KernelInterface, MockTensor, TensorWrapper, reinterpret
 from .errors import OutOfResources, InterpreterError
 from ._distributed import DistributedRtContext
+from .adjust_kernel_param import bucket_axes
 from .backend_caps import (
     BackendBucketingCapabilities,
     get_backend_capabilities,
@@ -83,4 +84,5 @@ __all__ = [
     "IntervalPolicy",
     "OnlineBucketPolicy",
     "warmup_buckets",
+    "bucket_axes",
 ]
