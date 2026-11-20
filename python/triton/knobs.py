@@ -468,6 +468,9 @@ class autotuning_knobs(base_knobs):
     shape_bucketing_mode: env_str = env_str("FLAGTREE_SHAPE_BUCKETING_MODE", "auto")
     shape_policy_path: env_opt_str = env_opt_str("FLAGTREE_SHAPE_POLICY_PATH")
     max_bucket_artifacts: env_opt_int = env_opt_int("FLAGTREE_MAX_BUCKET_ARTIFACTS")
+    compile_timeout_sec: env_opt_int = env_opt_int("FLAGTREE_COMPILE_TIMEOUT_SEC")
+    distributed_dispatch_guard: env_bool = env_bool("FLAGTREE_DISTRIBUTED_DISPATCH_GUARD", False)
+    oom_recovery: env_bool = env_bool("FLAGTREE_OOM_RECOVERY", True)
 
 
 class LaunchHook(Protocol):

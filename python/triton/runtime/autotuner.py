@@ -32,12 +32,7 @@ from typing import Dict, Tuple, List, Optional
 
 from .. import knobs
 from .jit import KernelInterface, JITFunction
-from .errors import BackendCompilerError, OutOfResources, PTXASError, AutotunerError
-try:
-    from .errors import CompileTimeoutError
-except ImportError:
-    class CompileTimeoutError(RuntimeError):
-        pass
+from .errors import BackendCompilerError, CompileTimeoutError, OutOfResources, PTXASError, AutotunerError
 from .driver import driver
 from .cache import get_cache_manager, triton_key
 from .adjust_kernel_param import auto_adjust_block_sizes
@@ -248,16 +243,12 @@ class Autotuner(KernelInterface):
 
             self.post_hook(full_nargs, exception=None)
 
-        try:
-            from ._async_compile import GLOBAL_COMPILE_BLACKLIST, run_with_compile_timeout
-        except ImportError:
-            GLOBAL_COMPILE_BLACKLIST = None
-            run_with_compile_timeout = None
+        from ._async_compile import GLOBAL_COMPILE_BLACKLIST, run_with_compile_timeout
         cfg_sig = str(config)
-        if GLOBAL_COMPILE_BLACKLIST is not None and GLOBAL_COMPILE_BLACKLIST.is_blacklisted(self.base_fn.__name__, cfg_sig):
+        if GLOBAL_COMPILE_BLACKLIST.is_blacklisted(self.base_fn.__name__, cfg_sig):
             return [float("inf"), float("inf"), float("inf")]
 
-        timeout_sec = getattr(knobs.autotuning, "compile_timeout_sec", None)
+        timeout_sec = knobs.autotuning.compile_timeout_sec
 
         def _invoke_bench():
             global _EVENT_TIMER_ZERO_DIV
@@ -271,7 +262,7 @@ class Autotuner(KernelInterface):
                 return _wallclock_bench_fallback(kernel_call)
 
         try:
-            if run_with_compile_timeout is not None and timeout_sec is not None and timeout_sec > 0:
+            if timeout_sec is not None and timeout_sec > 0:
                 rett = run_with_compile_timeout(
                     _invoke_bench,
                     timeout_sec,
