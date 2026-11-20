@@ -1309,6 +1309,29 @@ class IntervalPolicy:
             clamped_axes=clamped,
         )
 
+    def _ladder_for(self, axis_name: str) -> Tuple[int, ...]:
+        return self.fallback_policy._ladder_for(axis_name)
+
+    def bucket_dim_value(self, axis_name: str, value: int) -> Tuple[int, Optional[DispatchStatus]]:
+        return self.fallback_policy.bucket_dim_value(axis_name, value)
+
+    def normalize_scalar_for_autotune(self, *args: Any, **kwargs: Any) -> Tuple[Any, Optional[DispatchStatus]]:
+        return self.fallback_policy.normalize_scalar_for_autotune(*args, **kwargs)
+
+    def observe_args(self, all_args: Mapping[str, Any]) -> None:
+        self.fallback_policy.observe_args(all_args)
+
+    def mark_dynamic_axes(self, axes: Iterable[str], *, unaligned: bool = True) -> None:
+        self.fallback_policy.mark_dynamic_axes(axes, unaligned=unaligned)
+
+    def premark_dynamic_buckets(self, *args: Any, **kwargs: Any) -> None:
+        self.fallback_policy.premark_dynamic_buckets(*args, **kwargs)
+
+    def is_axis_dynamic(self, axis_name: str, value: Any) -> bool:
+        if axis_name in self.dynamic_axes:
+            return True
+        return self.fallback_policy.is_axis_dynamic(axis_name, value)
+
     def normalize_entry_scalar(
         self,
         param_name: str,

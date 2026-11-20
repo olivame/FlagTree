@@ -213,3 +213,26 @@ class TestOnlineShapeBucketing(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+def test_interval_policy_delegates_online_helpers(tmp_path):
+    from triton.runtime.shape_bucketing import IntervalPolicy, IntervalSegment
+
+    pol = IntervalPolicy(
+        dynamic_axis="M",
+        groups={"N=512::dtypes=bf16": [IntervalSegment(lo=1, hi=256, config_index=0, representative=128, regret_ms=0.01)]},
+        backend="ppu",
+    )
+    pol.observe_args({"M": 64, "N": 512})
+    pol.observe_args({"M": 192, "N": 512})
+    pol.mark_dynamic_axes(["M", "S"], unaligned=True)
+    assert pol.is_axis_dynamic("M", 64)
+    assert pol.is_axis_dynamic("S", 128)
+    b_val, _ = pol.bucket_dim_value("M", 130)
+    assert b_val >= 130
+    assert len(pol._ladder_for("M")) > 0
+    out_json = tmp_path / "pgo_policy.json"
+    pol.save_json(out_json)
+    loaded = IntervalPolicy.load_json(out_json)
+    loaded.observe_args({"M": 128, "N": 512})
+    assert loaded.is_axis_dynamic("M", 128)

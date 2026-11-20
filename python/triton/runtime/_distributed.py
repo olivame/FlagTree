@@ -482,7 +482,19 @@ def get_default_dispatch_guard() -> Optional[DistributedDispatchGuard]:
         return None
     with _DEFAULT_GUARD_LOCK:
         if _DEFAULT_DISPATCH_GUARD is None or _DEFAULT_DISPATCH_GUARD.world_size != ws or _DEFAULT_DISPATCH_GUARD.rank != rk:
-            _DEFAULT_DISPATCH_GUARD = DistributedDispatchGuard(world_size=ws, rank=rk)
+            pg = None
+            try:
+                if dist.is_gloo_available():
+                    pg = dist.new_group(backend="gloo")
+                else:
+                    pg = dist.new_group()
+            except Exception:
+                pg = None
+            _DEFAULT_DISPATCH_GUARD = DistributedDispatchGuard(
+                world_size=ws,
+                rank=rk,
+                process_group=pg,
+            )
         return _DEFAULT_DISPATCH_GUARD
 
 

@@ -270,3 +270,32 @@ class TestDistributedDispatchAndResilience(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_default_dispatch_guard_creates_isolated_gloo_pg(monkeypatch):
+    import sys
+    import types
+    import triton.runtime._distributed as dmod
+
+    sentinel_pg = object()
+    calls = []
+
+    fake_dist = types.SimpleNamespace(
+        is_available=lambda: True,
+        is_initialized=lambda: True,
+        get_world_size=lambda: 4,
+        get_rank=lambda: 1,
+        is_gloo_available=lambda: True,
+        new_group=lambda backend=None: (calls.append(backend), sentinel_pg)[1],
+    )
+    fake_torch = types.SimpleNamespace(distributed=fake_dist)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch.distributed", fake_dist)
+    monkeypatch.setattr(dmod, "_DEFAULT_DISPATCH_GUARD", None)
+
+    guard = dmod.get_default_dispatch_guard()
+    assert guard is not None
+    assert guard.world_size == 4
+    assert guard.rank == 1
+    assert guard.process_group is sentinel_pg
+    assert calls == ["gloo"]
