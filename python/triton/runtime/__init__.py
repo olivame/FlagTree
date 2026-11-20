@@ -31,6 +31,24 @@ from .driver import driver
 from .jit import JITFunction, KernelInterface, MockTensor, TensorWrapper, reinterpret
 from .errors import OutOfResources, InterpreterError
 from ._distributed import DistributedRtContext
+from .backend_caps import (
+    BackendBucketingCapabilities,
+    get_backend_capabilities,
+    register_backend_capabilities,
+    resolve_candidate_generator,
+    resolve_collective_device,
+    strip_int_alignment_spec,
+)
+from .shape_bucketing import (
+    BucketCacheBudget,
+    BucketLookupResult,
+    BucketingMode,
+    DispatchStatus,
+    GLOBAL_BUCKET_TELEMETRY,
+    IntervalPolicy,
+    OnlineBucketPolicy,
+    warmup_buckets,
+)
 
 __all__ = [
     "autotune",
@@ -50,4 +68,19 @@ __all__ = [
     "TensorWrapper",
     # flagtree tle distributed
     "DistributedRtContext",
+    # flagtree backend capabilities & online shape bucketing
+    "BackendBucketingCapabilities",
+    "get_backend_capabilities",
+    "register_backend_capabilities",
+    "resolve_candidate_generator",
+    "resolve_collective_device",
+    "strip_int_alignment_spec",
+    "BucketCacheBudget",
+    "BucketLookupResult",
+    "BucketingMode",
+    "DispatchStatus",
+    "GLOBAL_BUCKET_TELEMETRY",
+    "IntervalPolicy",
+    "OnlineBucketPolicy",
+    "warmup_buckets",
 ]

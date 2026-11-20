@@ -90,6 +90,15 @@ class BaseBackend(metaclass=ABCMeta):
         return src.make_ir(self.target, options, codegen_fns, module_map, context)
 
     # flagtree tileir: allow backend-specific TensorDescriptor cache specialization.
+    def get_bucketing_capabilities(self):
+        """Return optional ``BackendBucketingCapabilities`` for this backend.
+
+        Backends may override this hook to declare alignment divisibility,
+        minimum dot/load tile sizes, static grid baking, and collective/graph
+        capture capabilities without adding vendor branches to core runtime.
+        """
+        return None
+
     @staticmethod
     def get_tensor_descriptor_specialization(arg):
         """Return backend-specific TensorDescriptor cache-key attributes."""
