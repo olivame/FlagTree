@@ -41,15 +41,6 @@ from ._distributed import (
     RankDispatchState,
 )
 from ._async_compile import GLOBAL_COMPILE_BLACKLIST, run_with_compile_timeout
-from .adjust_kernel_param import bucket_axes
-from .backend_caps import (
-    BackendBucketingCapabilities,
-    get_backend_capabilities,
-    register_backend_capabilities,
-    resolve_candidate_generator,
-    resolve_collective_device,
-    strip_int_alignment_spec,
-)
 from .shape_bucketing import (
     BucketCacheBudget,
     BucketLookupResult,
@@ -60,6 +51,11 @@ from .shape_bucketing import (
     OnlineBucketPolicy,
     warmup_buckets,
 )
+from .shape_profiler import ProfileMode, ShapeProfiler
+from .bucket_guard import DecodeGraphBucketRunner, SymbolicBucketGuard, TokenBudgetBatcher
+from .backend_caps import BackendBucketingCapabilities, get_backend_capabilities, register_backend_capabilities
+from .adjust_kernel_param import bucket_axes
+from .graph_bucketing import GraphBucketCompiler, ModelCacheKey, build_model_cache_key, compile_with_bucketing
 
 __all__ = [
     "autotune",
@@ -89,13 +85,7 @@ __all__ = [
     "PerfRiskLevel",
     "RankDispatchState",
     "run_with_compile_timeout",
-    # flagtree backend capabilities & online shape bucketing
-    "BackendBucketingCapabilities",
-    "get_backend_capabilities",
-    "register_backend_capabilities",
-    "resolve_candidate_generator",
-    "resolve_collective_device",
-    "strip_int_alignment_spec",
+    # flagtree online shape bucketing
     "BucketCacheBudget",
     "BucketLookupResult",
     "BucketingMode",
@@ -104,5 +94,17 @@ __all__ = [
     "IntervalPolicy",
     "OnlineBucketPolicy",
     "warmup_buckets",
+    "ProfileMode",
+    "ShapeProfiler",
+    "SymbolicBucketGuard",
+    "DecodeGraphBucketRunner",
+    "TokenBudgetBatcher",
+    "BackendBucketingCapabilities",
+    "get_backend_capabilities",
+    "register_backend_capabilities",
     "bucket_axes",
+    "GraphBucketCompiler",
+    "ModelCacheKey",
+    "build_model_cache_key",
+    "compile_with_bucketing",
 ]

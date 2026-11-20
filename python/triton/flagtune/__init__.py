@@ -39,6 +39,24 @@ import os
 from triton.flagtune._version import __version__
 from triton.flagtune.core.interfaces import BenchmarkFn, ConfigProposer
 from triton.flagtune.runtime.autotuner import Flagtuner, flagtune
+from triton.flagtune.runtime.partition_planner import (
+    BucketedOperatorCostModel,
+    CollectiveCostModel,
+    HardwareClusterSpec,
+    InferenceConstraints,
+    ModelArchitectureSpec,
+    ParallelStrategyKind,
+    PartitionDecisionReport,
+    PartitionPlanCandidate,
+    DeviceMeshSpec,
+    ExecutableParallelPlan,
+    GraphWorkloadSpec,
+    OperatorStageSpec,
+    PartitionPlanner,
+    build_executable_plan,
+    TrainingConstraints,
+    WorkloadKind,
+)
 
 _ENABLED = None
 
