@@ -545,7 +545,23 @@ class JITCallable:
             self.used_global_vals = dict(sorted(dependencies_finder.used_global_vals.items()))
 
             from triton.language.core import constexpr
-            self.hash += str([(name, val)
+
+            def _stable_constexpr_token(v):
+                inner = getattr(v, "value", v)
+                if callable(inner):
+                    try:
+                        src = inspect.getsource(inner)
+                    except (OSError, TypeError):
+                        src = ""
+                    return (
+                        "constexpr_fn",
+                        getattr(inner, "__module__", ""),
+                        getattr(inner, "__qualname__", ""),
+                        src,
+                    )
+                return v
+
+            self.hash += str([(name, _stable_constexpr_token(val))
                               for (name, _), (val, _) in self.used_global_vals.items()
                               if isinstance(val, constexpr)])
             self.hash = hashlib.sha256(self.hash.encode("utf-8")).hexdigest()

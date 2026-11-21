@@ -236,3 +236,72 @@ def test_interval_policy_delegates_online_helpers(tmp_path):
     loaded = IntervalPolicy.load_json(out_json)
     loaded.observe_args({"M": 128, "N": 512})
     assert loaded.is_axis_dynamic("M", 128)
+
+
+def test_cross_bucket_dynamic_axis_promotion():
+    from triton.runtime.shape_bucketing import OnlineBucketPolicy
+
+    pol = OnlineBucketPolicy(divisibility=16, backend="ppu")
+    pol.observe_args({"M": 92, "N": 1024})
+    assert not pol.is_axis_dynamic("M", 92)
+    # Second observation in a DIFFERENT bucket (168 -> bucket 192 vs 92 -> bucket 96)
+    pol.observe_args({"M": 168, "N": 1024})
+    assert pol.is_axis_dynamic("M", 92)
+    assert pol.is_axis_dynamic("M", 336)
+    assert not pol.is_axis_dynamic("N", 1024)
+    # Aligned value in a new bucket of dynamic unaligned axis M must strip alignment
+    tok_m = pol.normalize_entry_scalar("M", 336, is_autotuned_key=True)
+    tok_n = pol.normalize_entry_scalar("N", 1024, is_autotuned_key=True)
+    assert tok_m[3] is False  # is_aligned stripped for dynamic unaligned M
+    assert tok_n[3] is True   # is_aligned preserved for static N=1024
+
+
+def test_constexpr_function_deterministic_cache_key(tmp_path):
+    import subprocess, sys, textwrap
+    script = tmp_path / "constexpr_k.py"
+    script.write_text(textwrap.dedent('''
+        import triton, triton.language as tl
+
+        @tl.constexpr
+        def _helper_dtype(x):
+            return tl.float32
+
+        @triton.jit
+        def _k(p, N, B: tl.constexpr):
+            dt: tl.constexpr = _helper_dtype(p.type.element_ty)
+            offs = tl.arange(0, B)
+            tl.store(p + offs, tl.zeros((B,), dtype=dt), mask=offs < N)
+
+        print(_k.cache_key)
+    '''), encoding="utf-8")
+    h1 = subprocess.check_output([sys.executable, str(script)], text=True).strip()
+    h2 = subprocess.check_output([sys.executable, str(script)], text=True).strip()
+    assert h1 == h2 and len(h1) == 64
+
+
+def test_heuristics_never_treats_block_tile_config_as_dynamic():
+    from triton.runtime.shape_bucketing import OnlineBucketPolicy, evaluate_heuristics_for_bucketing
+
+    pol = OnlineBucketPolicy(divisibility=16, backend="ppu")
+    # Simulate autotuner observing multiple configs (BLOCK_M=64 and BLOCK_M=128) across dynamic M
+    pol.observe_args({"M": 72, "N": 72, "K": 128, "BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32})
+    pol.observe_args({"M": 116, "N": 116, "K": 128, "BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64})
+    assert pol.is_axis_dynamic("M", 116)
+    assert not pol.is_axis_dynamic("BLOCK_M", 64)
+    assert not pol.is_axis_dynamic("BLOCK_N", 128)
+    assert not pol.is_axis_dynamic("BLOCK_K", 64)
+
+    def _full_m_tiles(args):
+        return int(args["M"]) % int(args["BLOCK_M"]) == 0
+
+    def _full_k_tiles(args):
+        return int(args["K"]) % int(args["BLOCK_K"]) == 0
+
+    ev = evaluate_heuristics_for_bucketing(
+        {"FULL_M_TILES": _full_m_tiles, "FULL_K_TILES": _full_k_tiles},
+        {"M": 116, "N": 116, "K": 128, "BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64},
+        pol,
+    )
+    # Must NEVER evaluate 1 % 1 == 0 -> True!
+    assert ev["FULL_M_TILES"] is False
+    assert ev["FULL_K_TILES"] is True

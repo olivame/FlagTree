@@ -365,6 +365,45 @@ def enforce_disk_cache_budget(
     return removed
 
 
+_CONFIG_CONSTEXPR_PREFIXES = (
+    "BLOCK_",
+    "TILE_",
+    "GROUP_",
+    "SPLIT_",
+    "PIPE_",
+    "LOAD_",
+    "NUM_",
+    "WARP_",
+    "STAGE_",
+    "EVEN_",
+    "FULL_",
+    "ALIGNED_",
+    "FUSE_",
+    "READ_",
+    "MASK_",
+    "HAS_",
+    "IS_",
+    "USE_",
+)
+_CONFIG_CONSTEXPR_EXACT = frozenset({
+    "num_warps",
+    "num_stages",
+    "num_ctas",
+    "maxnreg",
+    "waves_per_eu",
+    "matrix_instr_nonkdim",
+    "kpack",
+    "aiu_load_mask",
+    "B_TRANSPOSED",
+})
+
+
+def _is_config_constexpr_key(name: str) -> bool:
+    if name in _CONFIG_CONSTEXPR_EXACT:
+        return True
+    return name.startswith(_CONFIG_CONSTEXPR_PREFIXES)
+
+
 class OnlineBucketPolicy:
     """AST-guided universal online shape bucketing policy across chips and ops.
 
@@ -401,6 +440,8 @@ class OnlineBucketPolicy:
         # separate buckets (1 value each) and remain static, whereas dynamic seq_len
         # axes (M in MM, or M/N/K in BMM) observe multiple values in the same bucket.
         self._bucket_first_val: Dict[Tuple[str, int], int] = {}
+        self._axis_first_val: Dict[str, int] = {}
+        self._observed_dynamic_axes: set[str] = set()
         self._dynamic_buckets: set = set()
         self._unaligned_axes: set = set()
         self._unaligned_buckets: set = set()
@@ -628,7 +669,11 @@ class OnlineBucketPolicy:
         if value <= 0:
             return (int, value)
         bucket_hi, _ = self.bucket_dim_value(param_name, value)
-        if (param_name, bucket_hi) in self._unaligned_buckets or param_name in self._explicit_dynamic_axes:
+        if (
+            (param_name, bucket_hi) in self._unaligned_buckets
+            or param_name in self._explicit_dynamic_axes
+            or (param_name in self._observed_dynamic_axes and param_name in self._unaligned_axes)
+        ):
             is_aligned = False
         return ("ft_tune_int", bucket_hi, is_one, is_aligned, width)
 
@@ -636,8 +681,14 @@ class OnlineBucketPolicy:
         """Record observed integer argument values to distinguish dynamic bucketed
         axes from static dimensions without hardcoding parameter names."""
         for name, val in all_args.items():
-            if type(val) is not int or val <= 1:
+            if type(val) is not int or val <= 1 or _is_config_constexpr_key(name):
                 continue
+            first_ax = self._axis_first_val.get(name)
+            if first_ax is None:
+                if len(self._axis_first_val) < 512:
+                    self._axis_first_val[name] = val
+            elif first_ax != val:
+                self._observed_dynamic_axes.add(name)
             bhi, _ = self.bucket_dim_value(name, val)
             bkey = (name, bhi)
             first = self._bucket_first_val.get(bkey)
@@ -677,9 +728,9 @@ class OnlineBucketPolicy:
     def is_axis_dynamic(self, axis_name: str, value: Any) -> bool:
         """Return True iff ``axis_name`` is explicitly marked dynamic or has observed
         multiple raw values inside the same bucket containing ``value``."""
-        if type(value) is not int or value <= 0:
+        if type(value) is not int or value <= 1 or _is_config_constexpr_key(axis_name):
             return False
-        if axis_name in self._explicit_dynamic_axes:
+        if axis_name in self._explicit_dynamic_axes or axis_name in self._observed_dynamic_axes:
             return True
         bhi, _ = self.bucket_dim_value(axis_name, value)
         return (axis_name, bhi) in self._dynamic_buckets
@@ -1328,6 +1379,8 @@ class IntervalPolicy:
         self.fallback_policy.premark_dynamic_buckets(*args, **kwargs)
 
     def is_axis_dynamic(self, axis_name: str, value: Any) -> bool:
+        if type(value) is not int or value <= 1 or _is_config_constexpr_key(axis_name):
+            return False
         if axis_name in self.dynamic_axes:
             return True
         return self.fallback_policy.is_axis_dynamic(axis_name, value)
