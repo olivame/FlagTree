@@ -13,9 +13,9 @@
 | [KI-01](#ki-01) | Jina 系列模型因 `aiu_load_mask` 对齐翻转触发 Warmup 后额外重编译 | Medium | **RESOLVED in `v0.2.0-f09`** |
 | [KI-02](#ki-02) | T-Head PPU 多卡环境 `nccl` 后端出现 `ncclInternalError`（当前多卡验证基于 `gloo`） | Medium | Open (Vendor Runtime Boundary) |
 | [KI-03](#ki-03) | 离线/受限网络环境下 FlagTune Cost Model 预加载阻塞（需设置 `USE_FLAGTUNE_COST_MODEL=0`） | High (Ops) | Mitigated via Env |
-| [KI-04](#ki-04) | `PartitionPlanner` 当前为离线解析规划器，尚未直连在线分布式执行框架 | Low (Scope) | Planned (Phase 2) |
+| [KI-04](#ki-04) | `PartitionPlanner` 通信 Profile 校准与单机多卡执行器落地（跨节点/外部框架接入为后续范围） | Low (Scope) | **RESOLVED (Single-Node 4× PPU) in `v0.3.0-f09`** |
 | [KI-05](#ki-05) | 真机硬件验证边界：当前仅在单芯片平台（T-Head PPU-ZW810E）完成实机验证 | Medium (Scope) | Planned (Multi-Chip CI) |
-| [KI-06](#ki-06) | `DistributedDispatchGuard` 需对称进入受保护算子，NCCL/FlagCX 下建议显式初始化隔离 PG | Low (Usage) | Documented Contract |
+| [KI-06](#ki-06) | `DistributedDispatchGuard` 对称进入约定与多卡故障容错/超时熔断边界 | Low (Usage) | **Hardened in `v0.3.0-f09` (Usage Contract)** |
 | [KI-07](#ki-07) | `IntervalPolicy` 全局策略单文件映射与 `GraphBucketCompiler` / `DecodeGraphBucketRunner` 图捕获边界 | Medium | **RESOLVED in `v0.2.0-f09`** |
 | [KI-08](#ki-08) | 多进程共享 `TRITON_CACHE_DIR` 开启磁盘预算淘汰时缺少跨进程文件锁 | Low (Ops) | **RESOLVED in `v0.2.0-f09`** |
 
@@ -41,7 +41,7 @@
 - **复现方式**：在参考容器中设置 `CUDA_VISIBLE_DEVICES=0,1` 并运行 2-rank PyTorch 分布式脚本调用 `dist.init_process_group(backend="nccl")` 与 `dist.all_reduce(...)`，底层厂商通信库抛出 `ncclInternalError`。
 - **规避方法**：在当前 PPU 参考镜像中使用 `backend="gloo"` 执行多卡分布式通信；若业务侧已部署支持设备间高速互联的新版 PCCL / FlagCX 通信库，可通过 `init_default_dispatch_guard(create_gloo_group=True)` 将分桶守卫侧通道隔离至 `gloo` PG，不影响训练主通信组。
 - **责任人**：硬件运行环境与通信栈对接负责人（厂商 SDK 支持团队 + F09 分布式维护者 `@olivame`）。
-- **整改计划**：在正式交付《例外记录》中登记本运行环境边界；待 T-Head 厂商发布修复 `ncclInternalError` 的新版 `thead-ppu-runtime` / PCCL / FlagCX 镜像后，补跑多卡 `nccl`/`flagcx` 实机 DDP/TP 验收矩阵。
+- **整改计划**：在正式交付《例外记录》（`EX-002`）中登记本 `libpccl`/PCCL 运行环境边界；`v0.3.0-f09` 的 F09-G04（4× PPU 通信 Profile 与 DP/TP/PP/2D Hybrid 真实并行执行）及 F09-G05（4× PPU `SIGKILL`/超时/非对称 OOM 容错与长尾烤机）均已在真实 4 卡 PPU 设备张量 + `gloo` 控制/集合通道上完成验证；待 T-Head 厂商发布修复 `ncclInternalError` 的新版 `thead-ppu-runtime` / `libpccl` / FlagCX 镜像或真实 NVIDIA CUDA/NCCL CI 就绪后，补跑原生设备侧 `nccl`/`flagcx` 多卡验收矩阵。
 
 ### KI-03
 
@@ -61,7 +61,7 @@
 - **复现方式**：检索仓库中 `PartitionPlanner` / `build_executable_plan()` 的调用点，可见其输出结构化策略报告与 `ExecutableParallelPlan` JSON 字典，当前未内嵌调用分布式训练/推理框架的进程组创建 API；此外 `HardwareClusterSpec.inter_node_bandwidth_gbps` 与 `inter_node_latency_us` 当前作为多节点扩展字段预留，尚未接入跨节点分层代价曲线。
 - **规避方法**：在离线容量规划与并行策略选型阶段调用 `PartitionPlanner.plan_training()` / `plan_inference()` 生成 `ExecutableParallelPlan` JSON，再将输出的 `(dp, tp, pp, ep)` 维度映射为上层框架（TorchTitan / Megatron / vLLM）的启动参数。
 - **责任人**：FlagTune 并行规划模块维护者（`@olivame`）。
-- **整改计划**：二期路线图将补充跨节点分层通信代价曲线（启用 `inter_node_bandwidth_gbps` / `inter_node_latency_us`）、混合推理 `TP+PP`/`TP+EP` 搜索以及面向 `torch.distributed.device_mesh` 的薄适配层（目标版本：`v0.10-f09.2`）。
+- **整改计划**：**单机多卡通信 Profile 校准、可解释选型与真实并行执行已于 `v0.3.0-f09` 解决（RESOLVED for Single-Node 4× PPU）**。`F09-G04` (`025903bf12`) 新增 `triton.flagtune.runtime.comm_profiler`、`PartitionPlanner.from_comm_profile()`、结构化 5 键 `explanation`、`HYBRID_DP_PP` 与 `ParallelPlanExecutor`，在真实 4× PPU-ZW810E（`gloo`、`bfloat16`、`USE_FLAGTUNE_COST_MODEL=0`）上完成通信 Profile（`all_reduce 2.475 GB/s`, `p2p 2.657 GB/s`）与 3 类任务实跑：3/3 任务 Top-1 100% 命中真实最优（`dp2_pp2` 较未校准 Top-1 提速 `5.34×`/较 `tp4` `11.40×`；训练 `pp4` 较非均衡 `1.63×`/较未校准 `ddp4` `26.83×`；`Qwen3-1.7B` `replica_dp4` 较 `tp4` `22.42×`），平均 `concordance 0.3778 -> 0.9333`、`spearman_rho -0.4000 -> +0.9000`、`min_parity_cos = 0.999844`。跨节点分层代价曲线（`inter_node_*`）与 TorchTitan/Megatron/vLLM 外部框架适配器保持为后续多机迭代范围。
 
 ### KI-05
 
@@ -81,7 +81,7 @@
 - **复现方式**：(1) 若在 NCCL/FlagCX 环境中未调用 `init_default_dispatch_guard()`，守卫会使用默认 PG（`process_group=None`）执行协商，可能在 GPU 通信流上产生同步竞争；(2) 若某动态控制流分支（如稀疏 MoE 专家路由）仅在部分 Rank 上进入受守卫保护的内核入口，未进入的 Rank 不会参与该次 `negotiate()`。
 - **规避方法**：在 `dist.init_process_group()` 后由全部 Rank 统一调用一次 `triton.runtime.init_default_dispatch_guard(create_gloo_group=True)`；对于非对称条件触发的局部算子，关闭 `distributed_dispatch_guard` 或在算子外层使用对称控制流。
 - **责任人**：FlagTree 运行时分布式模块维护者（`@olivame`）。
-- **整改计划**：已通过 Fix-3 (`61534d97a2`) 彻底消除惰性 `dist.new_group()` 死锁并提供可重入 `dispatch_guard_scope()`；后续将在多卡框架集成中支持按算子粒度白名单/黑名单控制守卫启用。
+- **整改计划**：**已于 `v0.3.0-f09` 全面加固（Hardened）**。在 Fix-3 (`61534d97a2`) 消除惰性 `dist.new_group()` 死锁基础上，`F09-G05` (`ca4d466c87`，同独立验证 `ef5c5c0d51` diff) 新增 `comm_timeout_s`（`FLAGTREE_COMM_TIMEOUT_SEC`）有界超时熔断、`DistributedCommTimeoutError`/`DistributedRankFaultError` 结构化异常、`FallbackRegistry` (`HIGH`) 审计、`cleanup_after_fault()`（根治 `ProcessGroupGloo` 析构竞态）与 `CoordinatedStepGuard` 跨 Rank OOM 健康共识。真实 4× PPU-ZW810E 验证：`SIGKILL` `0.508–0.538s` 检测退出（wall `3.70s`）、12s 卡顿 `3.008–3.028s` 熔断（0 `std::terminate`）、`S=2047` 非对称 OOM `0.232–0.275s` 2-microbatch 协同恢复（`max_rank_param_diff=0.0`）、18 步长尾烤机 0 挂死。注：各 Rank 对称进入受保护算子的调用约定与进程进入集合前失联时的外部作业看门狗（`torchrun`/K8s）仍为既有使用契约。
 
 ### KI-07
 

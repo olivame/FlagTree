@@ -4,6 +4,78 @@ All notable changes for the FlagOS **F09 (Universal & Portable Dynamic Shape Buc
 
 ---
 
+## [v0.3.0-f09] — 2026-11-23
+
+### Documentation & Release Notes (`docs/f09-v030-release-notes`)
+- Updated `CHANGELOG.md`, `KNOWN_ISSUES.md`, `README.md`, and `DESIGN_AND_MAINTENANCE.md` for immutable release
+  **`v0.3.0-f09`** (0 Python/Shell files modified in this docs commit).
+- Updated **KI-04** (`PartitionPlanner` comm-profile calibration & single-node 4× PPU live execution) to
+  **RESOLVED (Single-Node 4× PPU) in `v0.3.0-f09`** and **KI-06** (`DistributedDispatchGuard` bounded timeout,
+  rank-fault isolation & `CoordinatedStepGuard`) to **Hardened in `v0.3.0-f09 (Usage Contract)`** while keeping
+  **KI-02** (`libpccl` `ncclInternalError` env boundary) and **KI-05** (non-PPU physical HW incl. Kunlunxin XPU)
+  transparently documented.
+
+### F09-G05 (`ca4d466c87c72485d5263dc14f8eef4ddf1dace4`) — 2026-11-23
+*(Stacked cleanly via zero-conflict cherry-pick on `F09-G04` `025903bf12`; bit-identical 5-file diff from isolated
+4× PPU verified commit `ef5c5c0d51b3913866e8d3220be16bdbe5269227`.)*
+- **Bounded Comm Timeout, Rank-Fault Isolation & `CoordinatedStepGuard` (`errors.py`, `_distributed.py`,
+  `__init__.py`)**:
+  - Added pickleable structured exceptions `DistributedCommTimeoutError` and `DistributedRankFaultError` carrying
+    `rank`, `world_size`, `op`, `phase`, `timeout_s`, and `cause`.
+  - Extended `RankDispatchState` with `ANY_RANK_FAULT = 16`, `CoordinatedDispatchDecision` with `degraded_solo`,
+    `fault_kind`, `fault_reason`, and `DistributedDispatchGuard` with `comm_timeout_s` (`FLAGTREE_COMM_TIMEOUT_SEC`),
+    `raise_on_fault`, `fallback_registry`, `release_memory_on_fault`, `_compute_work_wait_timeout()` (fixing the
+    PyTorch `ProcessGroupGloo` C++ teardown race), `cleanup_after_fault()`, and `reset_fault_state()`.
+  - Added `CoordinatedStepGuard` (`DistributedFaultCoordinator`) and `StepHealthDecision` providing cross-rank
+    OK/OOM/ERROR consensus (`check_step_health`), synchronized multi-rank OOM recovery (`recover_coordinated_oom` /
+    `run_coordinated_step`), and deterministic step-skip consensus on non-OOM local errors.
+- **Real 4× PPU-ZW810E Fault-Injection & Long-Tail Soak Verification (`CUDA_VISIBLE_DEVICES=12..15`, `gloo`,
+  `USE_FLAGTUNE_COST_MODEL=0`, `benchmarks/f09_g05_multicard_fault_injection.py`)**:
+  - **Fault 1 (`SIGKILL` Rank 3)**: BEFORE silent swallow + `rc=11` crash (`fallback_count=0`) -> AFTER surviving
+    3 ranks detect `DistributedRankFaultError` in **`0.508–0.538s`**, record `abort_rank_fault` (`HIGH`), and exit
+    cleanly (wall `3.70–3.71s`, `hung=[]`, `lingering=0`).
+  - **Fault 2 (`12.0s` stall vs `comm_timeout_s=3.0s`)**: BEFORE indefinite hang killed by `9.01s` watchdog ->
+    AFTER surviving 3 ranks trip `DistributedCommTimeoutError` in **`3.008–3.028s`**, record `abort_comm_timeout`
+    (`HIGH`), and clean up PG cleanly (wall `6.21s`, 0 `std::terminate`, `hung=[]`).
+  - **Fault 3 (`S=2047` asymmetric Rank 1 OOM)**: BEFORE cross-rank `all_reduce` deadlock killed by `8.01s`
+    watchdog -> AFTER `CoordinatedStepGuard` + 2-microbatch `OOMRecoveryController` recovers all 4 ranks in
+    **`0.232–0.275s`** (`all_finite=True`, **`max_rank_param_diff=0.0`**).
+  - **Scenario 4 (18-step long-tail `S=1..2047` × 2 rounds soak, `FLAGTREE_SHAPE_BUCKETING=1`)**: 17 committed
+    steps + 1 coordinated skip + 4 cross-rank OOM recoveries + 2 cold-compile window extensions in **`10.58s`**
+    (`all_finite=True`, **`max_rank_param_diff=0.0`**, 0 hangs, 0 lingering processes).
+- **Tests**: Added 4 multi-process & fault-coordination tests in `test_distributed_dispatch_guard.py`; combined
+  stacked FlagTree 7-file suite achieves **58/58 PASSED** (`63.50s` on PPU-15, 0 lines `>120` chars).
+
+### F09-G04 (`025903bf1233749559899094999f98ba0a5d405d`) — 2026-11-23
+- **Multi-Device Comm Profiler, Calibrated/Explainable Planner & Live Parallel Executor (`comm_profiler.py`,
+  `partition_planner.py`, `parallel_executor.py`, `flagtune/__init__.py`)**:
+  - Added backend-agnostic `triton.flagtune.runtime.comm_profiler` (`profile_comm_topology`, `CommProfileResult`,
+    `needs_host_staging`, JSON serialization, `to_collective_cost_model`, `to_hardware_topology`).
+  - Extended `partition_planner.py` with `ParallelStrategyKind.HYBRID_DP_PP`, `HardwareTopologySpec`,
+    `PartitionPlanner.from_comm_profile()`, structured 5-key `explanation` with quantified baseline comparisons,
+    and corrected non-decode PP micro-batch & Megatron TP `4 * AllReduce` cost modeling.
+  - Added `triton.flagtune.runtime.parallel_executor` (`ParallelPlanExecutor`) materializing `ExecutableParallelPlan`
+    (`DeviceMeshSpec`) into live DP / TP / PP / 2D Hybrid (`DP×PP`, `DP×TP`) sub-process-groups and sharded
+    inference/training execution with numerical parity verification.
+- **Real 4× PPU-ZW810E Comm Profile & 3-Workload Parallel Benchmark (`CUDA_VISIBLE_DEVICES=8..11`, `gloo`
+  host-staged, `bfloat16`, `USE_FLAGTUNE_COST_MODEL=0`, `benchmarks/f09_g04_parallel_benchmark.py`)**:
+  - **Comm Profile**: `all_reduce` `459.2 us` / `2.475 GB/s`, `all_gather` `296.3 us` / `1.015 GB/s`,
+    `reduce_scatter` `2153.8 us` / `0.895 GB/s`, `p2p` `115.9 us` / `2.657 GB/s` (all `emulated=False`).
+  - **Workload A (`Transformer-1B-16L`, 2 GiB/card infer)**: calibrated Top-1 `hybrid_dp2_pp2` (`28.28 ms`,
+    `95,063.4 tok/s`, `rho=+1.000`) beats uncalibrated Top-1 `dp2_tp2` (`151.09 ms`) by **`5.34×`** and naive
+    `tp4` (`322.46 ms`) by **`11.40×`**.
+  - **Workload B (`Transformer-1B-16L`, distributed train)**: calibrated Top-1 `balanced_pp4` (`134.75 ms`,
+    `22,798.6 tok/s`, `rho=+0.700`) beats unbalanced `pp4` by **`1.63×`**, `tp4` by **`5.56×`**, and uncalibrated
+    Top-1 `ddp4` (`3,615.75 ms`) by **`26.83×`**.
+  - **Workload C (`Qwen3-1.7B-16L`, full-mem infer)**: calibrated Top-1 `replica_dp4` (`13.96 ms`,
+    `183,359.3 tok/s`, `rho=+1.000`) beats `dp2_pp2` by **`2.02×`**, `pp4` by **`3.16×`**, and `tp4` by
+    **`22.42×`**.
+  - **Aggregate**: **3/3 (100%) Top-1 match**, mean `pairwise_concordance 0.3778 -> 0.9333`, mean `spearman_rho
+    -0.4000 -> +0.9000`, all 16 runs `all_finite=True`, `min_parity_cos = 0.999844 >= 0.999`.
+- **Tests**: Added 6 unit & live multi-process tests in `python/test/flagtune/test_comm_profiler_and_parallel_exec.py`.
+
+---
+
 ## [v0.2.0-f09] — 2026-11-22
 
 ### Documentation & Release Notes (`docs/f09-v020-release-notes`)

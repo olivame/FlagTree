@@ -10,23 +10,25 @@ FlagTree F09 organizes dynamic shape bucketing into four decoupled runtime layer
 
 ```text
 +-----------------------------------------------------------------------------+
-| Layer 4: Graph Bucketing, Profiling & Offline Planning (PR-4)               |
+| Layer 4: Graph Bucketing, Comm Profiling, Planning & Parallel Exec (PR4/G04)|
 |  - graph_bucketing.py   : GraphBucketCompiler, ModelCacheKey                |
 |  - bucket_guard.py      : SymbolicBucketGuard, DecodeGraphBucketRunner,     |
 |                           TokenBudgetBatcher                                |
 |  - shape_profiler.py    : ShapeProfiler (LLM / Retrieval / Training / Graph)|
-|  - partition_planner.py : Offline analytical PartitionPlanner (DDP/TP/PP/EP)|
+|  - comm_profiler.py     : Multi-device comm topology profiler (alpha-beta)  |
+|  - partition_planner.py : Calibrated & explainable PartitionPlanner         |
+|  - parallel_executor.py : Live DP/TP/PP/2D Hybrid ParallelPlanExecutor      |
 +-----------------------------------------------------------------------------+
                                       |
                                       v
 +-----------------------------------------------------------------------------+
-| Layer 3: Distributed Resilience & Circuit Breakers (PR-3 + Fix-1 + Fix-3)   |
-|  - _distributed.py      : DistributedDispatchGuard (non-collective default, |
-|                           eager init_default_dispatch_guard, re-entrant     |
-|                           dispatch_guard_scope/coordinate),                 |
-|                           OOMRecoveryController, FallbackRegistry           |
+| Layer 3: Distributed Resilience & Fault Tolerance (PR-3/Fix-1,3/G05)        |
+|  - _distributed.py      : DistributedDispatchGuard (bounded comm_timeout_s, |
+|                           rank-fault isolation, cleanup_after_fault),       |
+|                           CoordinatedStepGuard, OOMRecoveryController       |
 |  - _async_compile.py    : run_with_compile_timeout, CompileBlacklist        |
-|  - errors.py            : CompileTimeoutError                               |
+|  - errors.py            : CompileTimeoutError, DistributedCommTimeoutError, |
+|                           DistributedRankFaultError                         |
 +-----------------------------------------------------------------------------+
                                       |
                                       v
@@ -53,9 +55,9 @@ FlagTree F09 organizes dynamic shape bucketing into four decoupled runtime layer
 
 ---
 
-## 2. Module Inventory / 模块清单（`e86aa7c..61534d97`）
+## 2. Module Inventory / 模块清单（`e86aa7c..v0.3.0-f09`）
 
-### 2.1 Runtime Modules (17 files)
+### 2.1 Runtime Modules (19 files + 2 multi-card benchmarks)
 | File | Origin | Responsibility |
 | --- | --- | --- |
 | `python/triton/backends/compiler.py` | PR-1 | Adds optional `BaseBackend.get_bucketing_capabilities()` hook |
@@ -66,25 +68,30 @@ FlagTree F09 organizes dynamic shape bucketing into four decoupled runtime layer
 | `python/triton/runtime/autotuner.py` | PR-2, PR-3, Fix-3 | Bucketing lookup, guard mismatch fallback, re-entrant `dispatch_guard_scope()` integration, OOM retry, compile timeout circuit breaker, LRU cache budget |
 | `python/triton/runtime/adjust_kernel_param.py` | PR-2, Fix-3 | AST-based dynamic axis inference (`bucket_axes`) and AABS cooperation |
 | `python/triton/runtime/cache.py` | PR-2 | Disk binary cache entry/byte budget eviction (`enforce_binary_cache_budget`) |
-| `python/triton/runtime/_distributed.py` | PR-3, Fix-1, Fix-3 | `DistributedDispatchGuard`, `init_default_dispatch_guard`, `get_default_dispatch_guard`, `reset_default_dispatch_guard`, `dispatch_guard_scope`, `is_in_dispatch_guard_scope`, `OOMRecoveryController`, `FallbackRegistry` |
+| `python/triton/runtime/_distributed.py` | PR-3, Fix-1/3, FT-P1-B, G05 | `DistributedDispatchGuard` (bounded `comm_timeout_s`, rank-fault isolation, `cleanup_after_fault`), `CoordinatedStepGuard`, `StepHealthDecision`, `OOMRecoveryController`, `FallbackRegistry` |
 | `python/triton/runtime/_async_compile.py` | PR-3 | Subprocess/thread timeout execution (`run_with_compile_timeout`) and `GLOBAL_COMPILE_BLACKLIST` |
-| `python/triton/runtime/errors.py` | PR-3, Fix-3 | `CompileTimeoutError` exception class |
+| `python/triton/runtime/errors.py` | PR-3, Fix-3, G05 | `CompileTimeoutError`, `DistributedCommTimeoutError`, `DistributedRankFaultError` |
 | `python/triton/runtime/shape_profiler.py` | PR-4, Fix-3 | Multi-mode `ShapeProfiler` (`ProfileMode`: LLM serving, retrieval, training, generic graph) |
 | `python/triton/runtime/bucket_guard.py` | PR-4 | `SymbolicBucketGuard`, `DecodeGraphBucketRunner`, `TokenBudgetBatcher` |
 | `python/triton/runtime/graph_bucketing.py` | PR-4 | `GraphBucketCompiler`, `ModelCacheKey`, `build_model_cache_key`, `compile_with_bucketing` |
-| `python/triton/flagtune/runtime/partition_planner.py` | PR-4, Fix-3 | Offline analytical `PartitionPlanner`, piecewise alpha-beta `CollectiveCostModel`, `BucketedOperatorCostModel`, `build_executable_plan` |
-| `python/triton/runtime/__init__.py` | PR-1..4, Fix-3 | Public runtime API re-exports |
-| `python/triton/flagtune/__init__.py` | PR-4 | Public `PartitionPlanner` & cost-model re-exports |
+| `python/triton/flagtune/runtime/comm_profiler.py` | G04 | Backend-agnostic `profile_comm_topology()`, `CommProfileResult`, `needs_host_staging()`, JSON roundtrip & cost-model calibration |
+| `python/triton/flagtune/runtime/partition_planner.py` | PR-4, Fix-3, G04 | Calibrated & explainable `PartitionPlanner`, `HYBRID_DP_PP`, `HardwareTopologySpec`, `from_comm_profile()`, `CollectiveCostModel`, `build_executable_plan` |
+| `python/triton/flagtune/runtime/parallel_executor.py` | G04 | Live multi-device `ParallelPlanExecutor` (DP / TP / PP / `DP×PP` / `DP×TP` sub-PGs, sharded execution & numerical parity checks) |
+| `python/triton/runtime/__init__.py` | PR-1..4, Fix-3, G05 | Public runtime API re-exports (incl. `CoordinatedStepGuard` & fault exceptions) |
+| `python/triton/flagtune/__init__.py` | PR-4, G04 | Public `comm_profiler`, `PartitionPlanner`, and `ParallelPlanExecutor` re-exports |
+| `benchmarks/f09_g04_parallel_benchmark.py` | G04 | Portable multi-device comm-profile & 3-workload DP/TP/PP/Hybrid benchmark |
+| `benchmarks/f09_g05_multicard_fault_injection.py` | G05 | Portable multi-device `SIGKILL`, comm-timeout, asymmetric OOM & long-tail soak drill |
 
-### 2.2 Unit Test Suites (6 files, 48 tests)
+### 2.2 Unit Test Suites (7 files, 58 tests)
 | Test File | Coverage |
 | --- | --- |
 | `python/test/unit/runtime/test_backend_caps_and_shape_bucketing.py` | Capability registry, AST heuristics, `OnlineBucketPolicy`, `IntervalPolicy`, deterministic callable `cache_key`, tile `constexpr` exclusion |
 | `python/test/unit/runtime/test_runtime_bucketing_and_cache_budget.py` | `JITFunction` bucket-scoped alignment stripping, multi-tag alignment normalization, cache budget |
-| `python/test/unit/runtime/test_distributed_dispatch_guard.py` | 8-rank skew negotiation, compile timeout circuit breaker, infer/train OOM recovery, lazy non-collective vs eager isolated `gloo` PG, re-entrant `dispatch_guard_scope()` / `coordinate()`, real 2-process `gloo` regression |
+| `python/test/unit/runtime/test_distributed_dispatch_guard.py` | 8-rank skew negotiation, compile timeout, bounded `comm_timeout_s` & rank-fault isolation, `CoordinatedStepGuard` asymmetric OOM/error consensus, real 2-process `gloo` `SIGKILL`/stall/OOM regression |
 | `python/test/unit/runtime/test_shape_profiler_and_guard.py` | Three-mode `ShapeProfiler`, `SymbolicBucketGuard`, `DecodeGraphBucketRunner`, `TokenBudgetBatcher` |
 | `python/test/unit/runtime/test_f09_portability_and_generality.py` | Cross-backend plugin portability, disk cache budget, explicit `bucket_axes`, `Autotuner` guard + OOM integration, `GraphBucketCompiler`, 3D `PartitionPlanner` |
 | `python/test/flagtune/test_partition_planner.py` | Calibrated inference/training/MoE/retrieval parallel strategy selection and piecewise collective curve fitting |
+| `python/test/flagtune/test_comm_profiler_and_parallel_exec.py` | Comm profile JSON/calibration, `HYBRID_DP_PP` mesh, live multi-process `comm_profiler` & `ParallelPlanExecutor` DP/TP/PP/Hybrid parity |
 
 ---
 
@@ -151,8 +158,8 @@ Lookup precedence in `get_backend_capabilities(backend)`:
    Upstream `JITFunction.cache_key` stringified callable `@tl.constexpr` arguments as `<function foo at 0x7f...>`, embedding process-random memory addresses and breaking cross-process disk cache reuse. Hashing `(module, qualname, inspect.getsource)` restores deterministic `.hgbin` reuse across restarts.
 4. **Exclusion of tile/config `constexpr` keys from dynamic-axis tracking**:
    During autotuning, `BLOCK_M`/`BLOCK_N`/`BLOCK_K` vary across candidate trials. Tracking them as dynamic shape axes caused heuristic divisibility checks such as `FULL_M_TILES = (M % BLOCK_M == 0)` to evaluate `1 % 1 == 0 -> True`, corrupting boundary masks. Filtering config constexpr names prevents silent accuracy corruption.
-5. **Offline analytical `PartitionPlanner`**:
-   `PartitionPlanner` intentionally separates analytical strategy search and `ExecutableParallelPlan` JSON generation from framework-specific runtime orchestrators (TorchTitan, Megatron, vLLM) to keep FlagTree dependency-free; live runtime execution bridging is tracked as a follow-up item (see [KNOWN_ISSUES.md](./KNOWN_ISSUES.md#ki-04)).
+5. **Comm-calibrated `PartitionPlanner` & single-node `ParallelPlanExecutor`**:
+   In `v0.3.0-f09`, `comm_profiler.py` calibrates `PartitionPlanner` from live multi-device collectives and `ParallelPlanExecutor` executes DP/TP/PP/2D Hybrid plans natively on single-node multi-device topologies while keeping FlagTree free of external framework dependencies; multi-node hierarchical curves and third-party TorchTitan/Megatron/vLLM adapters remain future scope (see [KNOWN_ISSUES.md](./KNOWN_ISSUES.md#ki-04)).
 
 ---
 
@@ -160,7 +167,7 @@ Lookup precedence in `get_backend_capabilities(backend)`:
 
 ### 6.1 Upstream Baseline & Ordered Commit Stack
 - **Upstream Base**: `FlagTree@e86aa7cf` (Triton 3.6.0 / FlagTree 0.7.0)
-- **Ordered F09 Stack (`v0.2.0-f09`)** (9 code commits + 2 docs commits = 11 commits):
+- **Ordered F09 Stack (`v0.3.0-f09`)** (11 code commits + 3 docs commits = 14 commits):
   1. `b99e75cb` — PR-1: `backend_caps.py` + `shape_bucketing.py` + `BaseBackend` hook
   2. `e42e6213` — PR-2: `jit.py`, `autotuner.py`, `adjust_kernel_param.py`, `cache.py`, `knobs.py` integration
   3. `28a520ce` — PR-3: `_distributed.py`, `_async_compile.py`, `errors.py`
@@ -171,10 +178,13 @@ Lookup precedence in `get_backend_capabilities(backend)`:
   8. `b04da1ef` — Docs (`v0.1.0-f09`): bilingual F09 guide, design/maintenance docs, known issues, changelog, and `SECURITY.md`
   9. `9b92bd75` — FT-P1-A: Auto-PGO `IntervalPolicy` / `group_frontier()` fixes, `GraphBucketCompiler` LRU cache & `seq_axis`, and `DecodeGraphBucketRunner` eager fallback / static device Tensor `static_kv_lens`
   10. `e4522a5f` — FT-P1-B: POSIX `fcntl.flock` binary cache eviction lock, FP8 `min_dot_size` (`K >= 32`), and core vendor dehardcoding
-  11. `v0.2.0-f09` Docs: updated `CHANGELOG.md`, `KNOWN_ISSUES.md` (KI-01/KI-07/KI-08 RESOLVED), `README.md`, and `DESIGN_AND_MAINTENANCE.md`
+  11. `cb8ec1c2` — Docs (`v0.2.0-f09`): updated `CHANGELOG.md`, `KNOWN_ISSUES.md` (KI-01/KI-07/KI-08 RESOLVED), `README.md`, and `DESIGN_AND_MAINTENANCE.md`
+  12. `025903bf` — F09-G04: `comm_profiler.py`, calibrated/explainable `PartitionPlanner` (`HYBRID_DP_PP`), and `ParallelPlanExecutor` (+ 6 tests & benchmark)
+  13. `ca4d466c` — F09-G05: bounded `comm_timeout_s`, `DistributedCommTimeoutError`/`DistributedRankFaultError`, `cleanup_after_fault`, and `CoordinatedStepGuard` (+ 4 tests & fault-injection benchmark)
+  14. `v0.3.0-f09` Docs: updated `CHANGELOG.md`, `KNOWN_ISSUES.md` (KI-04 RESOLVED single-node 4× PPU, KI-06 Hardened), `README.md`, and `DESIGN_AND_MAINTENANCE.md`
 
 ### 6.2 Rebasing onto a Newer Upstream FlagTree / Triton Release
-1. **Primary conflict hotspots** (only 6 upstream-modified files contain F09 hooks; the other 11 runtime files are self-contained F09 additions):
+1. **Primary conflict hotspots** (only 6 upstream-modified files contain F09 hooks; the other 13 runtime files are self-contained F09 additions):
    - `python/triton/runtime/jit.py` (`cache_key` and alignment specialization stripping)
    - `python/triton/runtime/autotuner.py` (`run()` bucket lookup, dispatch guard scope, timeout/OOM hooks)
    - `python/triton/runtime/adjust_kernel_param.py` (`bucket_axes` AST helper)
@@ -192,7 +202,7 @@ Lookup precedence in `get_backend_capabilities(backend)`:
    git diff --check upstream/main..HEAD
    python3 -m py_compile $(git diff --name-only upstream/main..HEAD -- '*.py')
 
-   # 3. Run isolated --target install + all 6 FlagTree F09 unit test files
+   # 3. Run isolated --target install + all 7 FlagTree F09 unit test files
    bash <FlagGems_repo>/tools/install_f09_editable.sh \
        --flagtree "$(pwd)" --flaggems <FlagGems_repo> --target /tmp/f09_upgrade_check
    USE_FLAGTUNE_COST_MODEL=0 PYTHONPATH=/tmp/f09_upgrade_check pytest -v \
@@ -201,6 +211,7 @@ Lookup precedence in `get_backend_capabilities(backend)`:
        python/test/unit/runtime/test_distributed_dispatch_guard.py \
        python/test/unit/runtime/test_shape_profiler_and_guard.py \
        python/test/unit/runtime/test_f09_portability_and_generality.py \
-       python/test/flagtune/test_partition_planner.py
+       python/test/flagtune/test_partition_planner.py \
+       python/test/flagtune/test_comm_profiler_and_parallel_exec.py
    ```
 3. **Sync with FlagGems**: If `triton.runtime._distributed` or `shape_bucketing` helper signatures change during rebase, re-verify FlagGems `tests/test_libentry_shape_bucketing.py` and `tests/test_training_ops_ppu.py` together against the same `--target` directory.

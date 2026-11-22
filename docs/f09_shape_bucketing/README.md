@@ -17,8 +17,8 @@ FlagTree F09 introduces a portable, backend-agnostic **Dynamic Shape Bucketing &
 Core capabilities include:
 - **Backend Capability Registry (`backend_caps.py`)**: Centralizes alignment divisibility, minimum `tl.dot`/load tile sizes, static grid baking, collective device mapping, and Device Graph APIs behind `BaseBackend.get_bucketing_capabilities()`.
 - **Online & Offline Shape Bucketing (`shape_bucketing.py`, `jit.py`, `autotuner.py`, `adjust_kernel_param.py`, `cache.py`)**: AST-driven dynamic-axis inference, geometric/piecewise bucket ladders, bucket-scoped alignment normalization, deterministic `@tl.constexpr` callable cache keys, and bounded binary/memory cache eviction.
-- **Distributed Resilience (`_distributed.py`, `_async_compile.py`, `errors.py`)**: Cross-rank `DistributedDispatchGuard` (non-collective default lookup, eager isolated `gloo` PG setup, re-entrant `dispatch_guard_scope()`/`coordinate()`), differentiated inference/training `OOMRecoveryController`, and compile timeout circuit breaker with blacklist.
-- **Graph Bucketing, Profiling & Offline Partition Planning (`graph_bucketing.py`, `bucket_guard.py`, `shape_profiler.py`, `partition_planner.py`)**: Multi-mode `ShapeProfiler`, `SymbolicBucketGuard`, `TokenBudgetBatcher`, `GraphBucketCompiler`, and analytical `PartitionPlanner`.
+- **Distributed Resilience & Multi-Card Fault Tolerance (`_distributed.py`, `_async_compile.py`, `errors.py`)**: Cross-rank `DistributedDispatchGuard` (bounded `comm_timeout_s`, rank-fault isolation, `cleanup_after_fault`, re-entrant `dispatch_guard_scope()`/`coordinate()`), `CoordinatedStepGuard` (multi-rank asymmetric OOM consensus & recovery), differentiated inference/training `OOMRecoveryController`, and compile timeout circuit breaker.
+- **Graph Bucketing, Profiling, Comm Calibration & Parallel Execution (`graph_bucketing.py`, `bucket_guard.py`, `shape_profiler.py`, `comm_profiler.py`, `partition_planner.py`, `parallel_executor.py`)**: Multi-mode `ShapeProfiler`, `SymbolicBucketGuard`, `TokenBudgetBatcher`, `GraphBucketCompiler`, real-topology `profile_comm_topology()`, calibrated explainable `PartitionPlanner`, and live multi-device `ParallelPlanExecutor` (DP / TP / PP / 2D Hybrid).
 
 **中文简介**：
 FlagTree F09 为 Triton/FlagTree 编译器运行时提供**架构无关、可移植的动态 Shape 分桶与容错调度能力**。在不向通用运行时硬编码厂商分支的前提下，显著消除变长序列、动态 Batch 等场景下的重复 JIT 编译与自动调优抖动，默认关闭（`FLAGTREE_SHAPE_BUCKETING=0`）以保持与上游 100% 兼容，按需通过环境变量或 Python `triton.knobs` 启用。
@@ -26,8 +26,8 @@ FlagTree F09 为 Triton/FlagTree 编译器运行时提供**架构无关、可移
 核心能力包括：
 - **后端能力注册表（`backend_caps.py`）**：统一描述对齐整除性、最小 `tl.dot`/访存分块、静态 Grid 烘焙、集合通信设备映射与 Device Graph API，彻底解耦厂商特化判断。
 - **在线/离线动态分桶与缓存预算（`shape_bucketing.py`、`jit.py`、`autotuner.py`、`cache.py`）**：基于 AST 静态分析自动识别动态轴与启发式谓词、几何/分段分桶阶梯、跨进程确定性 `@tl.constexpr` 函数哈希及内存/磁盘二进制缓存预算淘汰。
-- **多卡防死锁守卫、OOM 自愈与编译超时熔断（`_distributed.py`、`_async_compile.py`）**：提供默认非集合获取 + 显式独立 `gloo` 侧通道初始化 + 可重入作用域的 `DistributedDispatchGuard`、推理/训练差异化 `OOMRecoveryController` 与超时熔断黑名单。
-- **图级分桶、离线画像与并行切分规划（`graph_bucketing.py`、`bucket_guard.py`、`shape_profiler.py`、`partition_planner.py`）**：支持三模式 `ShapeProfiler`、符号边界守卫、Token 预算合批器与离线解析式 `PartitionPlanner`。
+- **多卡故障容错、有界超时熔断与跨卡 OOM 自愈（`_distributed.py`、`_async_compile.py`、`errors.py`）**：提供有界 `comm_timeout_s`、对端故障隔离、`cleanup_after_fault` 与可重入作用域的 `DistributedDispatchGuard`、跨 Rank OOM 共识恢复 `CoordinatedStepGuard`、推理/训练差异化 `OOMRecoveryController` 与编译超时熔断黑名单。
+- **图级分桶、通信 Profile 校准与多卡并行执行器（`graph_bucketing.py`、`bucket_guard.py`、`shape_profiler.py`、`comm_profiler.py`、`partition_planner.py`、`parallel_executor.py`）**：支持三模式 `ShapeProfiler`、符号边界守卫、Token 预算合批器、真实拓扑通信 Profile 校准可解释 `PartitionPlanner` 及多卡 DP/TP/PP/2D Hybrid `ParallelPlanExecutor`。
 
 ---
 
@@ -37,7 +37,7 @@ FlagTree F09 为 Triton/FlagTree 编译器运行时提供**架构无关、可移
 | --- | --- | --- |
 | **Python / PyTorch / Triton** | **Verified** | Python 3.12.3, PyTorch 2.10.0, Triton 3.6.0, FlagTree 0.7.0 base (`e86aa7cf`), pytest 7.2.0 |
 | **Container Runtime (Reference)** | **Verified** | `flagrt/thead-ppu-runtime:1.0.0-ppu3.6-py312-torch2.10.0-flagtree0.7.0-triton3.6.0-x86_64` (`sha256:1ba7ead15378160ba9aa1dafcfb77686de6b16732590ffab062bab19c60c32b8`) |
-| **T-Head PPU-ZW810E (1 / 3 / 4 cards)** | **Verified (HW)** | Full FlagTree F09 unit suite (48/48), FlagGems op/training suite (25/25), multi-model E2E & DDP (`gloo`) |
+| **T-Head PPU-ZW810E (1 / 3 / 4 cards)** | **Verified (HW)** | Full FlagTree F09 unit suite (58/58), FlagGems op/training suite (25/25), 18/18 E2E, 4× PPU G04 parallel exec & G05 fault tolerance (`gloo`) |
 | **NVIDIA CUDA / AMD ROCm / Ascend NPU / XPU / MLU / MUSA** | **Portable / Pending HW Sign-off** | Backend capability profiles & portable unit tests pass; dedicated physical hardware CI verification pending (see [KNOWN_ISSUES.md](./KNOWN_ISSUES.md#ki-05)) |
 
 ### Dependencies / 依赖说明
@@ -58,6 +58,7 @@ FlagTree F09 为 Triton/FlagTree 编译器运行时提供**架构无关、可移
 | `FLAGTREE_MAX_CACHE_BYTES` | `knobs.cache.max_cache_bytes` | `None` | Disk binary cache byte budget / 磁盘编译缓存字节预算上限 |
 | `FLAGTREE_COMPILE_TIMEOUT_SEC` | `knobs.autotuning.compile_timeout_sec` | `None` | Per-config compile timeout circuit breaker (seconds) / 单配置编译超时熔断秒数 |
 | `FLAGTREE_DISTRIBUTED_DISPATCH_GUARD` | `knobs.autotuning.distributed_dispatch_guard` | `False` (`0`) | Enable cross-rank dispatch guard negotiation / 启用多卡调度防死锁守卫 |
+| `FLAGTREE_COMM_TIMEOUT_SEC` | `_distributed` (`comm_timeout_s`) | `None` (opt-in) | Bounded collective timeout (seconds) for `DistributedDispatchGuard` & `CoordinatedStepGuard` / 多卡守卫有界通信超时（秒） |
 | `FLAGTREE_OOM_RECOVERY` | `knobs.autotuning.oom_recovery` | `True` (`1`) | Enable OOM config retry & fallback audit / 启用 OOM 自动恢复与审计记录 |
 
 ---
@@ -162,7 +163,7 @@ dist.destroy_process_group()
 
 ## 6. Running Unit Tests / 运行单元测试
 
-Run all 6 FlagTree F09 unit test suites (48 tests total) against an isolated `--target` installation:
+Run all 7 FlagTree F09 unit test suites (58 tests total) against an isolated `--target` installation:
 
 ```bash
 USE_FLAGTUNE_COST_MODEL=0 PYTHONPATH=/tmp/f09_isolated pytest -v \
@@ -171,10 +172,11 @@ USE_FLAGTUNE_COST_MODEL=0 PYTHONPATH=/tmp/f09_isolated pytest -v \
     python/test/unit/runtime/test_distributed_dispatch_guard.py \
     python/test/unit/runtime/test_shape_profiler_and_guard.py \
     python/test/unit/runtime/test_f09_portability_and_generality.py \
-    python/test/flagtune/test_partition_planner.py
+    python/test/flagtune/test_partition_planner.py \
+    python/test/flagtune/test_comm_profiler_and_parallel_exec.py
 ```
 
-Expected result: **`48 passed, 0 failed`**.
+Expected result: **`58 passed, 0 failed`**.
 
 ---
 
