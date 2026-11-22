@@ -290,7 +290,15 @@ class TestF09PortabilityAndGenerality(unittest.TestCase):
         dlrm_graph = GraphWorkloadSpec(
             name="dlrm_ctr",
             stages=(
-                OperatorStageSpec("emb_sparse", "embedding_table", 1e8, 0, 1 << 24, embedding_table_bytes=120 << 30, comm_bytes_per_step=16 << 20),
+                OperatorStageSpec(
+                    "emb_sparse",
+                    "embedding_table",
+                    1e8,
+                    0,
+                    1 << 24,
+                    embedding_table_bytes=120 << 30,
+                    comm_bytes_per_step=16 << 20,
+                ),
                 OperatorStageSpec("bottom_mlp", "mlp", 2e10, 64 << 20, 32 << 20),
                 OperatorStageSpec("top_mlp", "mlp", 4e10, 128 << 20, 32 << 20),
             ),
@@ -309,10 +317,15 @@ class TestF09PortabilityAndGenerality(unittest.TestCase):
         self.assertGreaterEqual(len(cnn_spec.stages), 2)
 
         # 3. 8-device 3D Hybrid Parallelism + ExecutableParallelPlan export
-        cluster8 = HardwareClusterSpec(num_devices=8, device_memory_bytes=96 << 30, backend="ascend", devices_per_node=8)
+        cluster8 = HardwareClusterSpec(
+            num_devices=8, device_memory_bytes=96 << 30, backend="ascend", devices_per_node=8
+        )
         planner8 = PartitionPlanner(cluster8)
         m70b = ModelArchitectureSpec("Llama-70B", 80, 8192, 28672, 64, 8, 128256)
-        train_rep = planner8.plan_training(m70b, TrainingConstraints(global_batch_size=32, seq_len=4096, activation_checkpointing=True))
+        train_rep = planner8.plan_training(
+            m70b,
+            TrainingConstraints(global_batch_size=32, seq_len=4096, activation_checkpointing=True),
+        )
         all_strats = {c.strategy for c in train_rep.ranked_candidates + train_rep.rejected_candidates}
         self.assertIn(ParallelStrategyKind.HYBRID_3D, all_strats)
 

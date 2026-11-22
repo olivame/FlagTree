@@ -363,7 +363,10 @@ class ShapeProfiler:
                 bounds: Dict[str, Tuple[int, int]] = {}
                 all_m = self._prefill_tokens + self._decode_batches
                 if all_m:
-                    bounds["M"] = (max(1, min(all_m)), geometric_bucket_ceil(max(all_m), build_axis_ladder(mode=b_mode)))
+                    bounds["M"] = (
+                        max(1, min(all_m)),
+                        geometric_bucket_ceil(max(all_m), build_axis_ladder(mode=b_mode)),
+                    )
                 if self._decode_kv_lens:
                     bounds["KV_CTX"] = (
                         max(1, min(self._decode_kv_lens)),

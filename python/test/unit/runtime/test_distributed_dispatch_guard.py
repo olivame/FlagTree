@@ -31,6 +31,12 @@ from types import SimpleNamespace
 
 
 def _ensure_triton_importable() -> None:
+    try:
+        from triton._C.libtriton import getenv as _g  # noqa: F401
+        from triton.runtime import _distributed as _d  # noqa: F401
+        return
+    except Exception:
+        pass
     repo_python = Path(__file__).resolve().parents[3]
     if str(repo_python) not in sys.path:
         sys.path.insert(0, str(repo_python))
@@ -278,24 +284,197 @@ def test_default_dispatch_guard_creates_isolated_gloo_pg(monkeypatch):
     import triton.runtime._distributed as dmod
 
     sentinel_pg = object()
+    world_pg_1 = object()
+    world_pg_2 = object()
     calls = []
 
+    fake_group = types.SimpleNamespace(WORLD=world_pg_1)
     fake_dist = types.SimpleNamespace(
         is_available=lambda: True,
         is_initialized=lambda: True,
         get_world_size=lambda: 4,
         get_rank=lambda: 1,
         is_gloo_available=lambda: True,
+        group=fake_group,
         new_group=lambda backend=None: (calls.append(backend), sentinel_pg)[1],
     )
     fake_torch = types.SimpleNamespace(distributed=fake_dist)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     monkeypatch.setitem(sys.modules, "torch.distributed", fake_dist)
-    monkeypatch.setattr(dmod, "_DEFAULT_DISPATCH_GUARD", None)
+    dmod.reset_default_dispatch_guard()
 
-    guard = dmod.get_default_dispatch_guard()
-    assert guard is not None
-    assert guard.world_size == 4
-    assert guard.rank == 1
-    assert guard.process_group is sentinel_pg
+    # 1. Lazy get_default_dispatch_guard() MUST be strictly non-collective (no dist.new_group)
+    lazy_guard = dmod.get_default_dispatch_guard()
+    assert lazy_guard is not None
+    assert lazy_guard.world_size == 4
+    assert lazy_guard.rank == 1
+    assert lazy_guard.process_group is None
+    assert calls == []
+
+    # 2. Eager init_default_dispatch_guard() collectively creates an isolated gloo PG
+    eager_guard = dmod.init_default_dispatch_guard()
+    assert eager_guard is not None
+    assert eager_guard.world_size == 4
+    assert eager_guard.rank == 1
+    assert eager_guard.process_group is sentinel_pg
     assert calls == ["gloo"]
+
+    # 3. Subsequent get_default_dispatch_guard() reuses the eager isolated guard
+    assert dmod.get_default_dispatch_guard() is eager_guard
+    assert calls == ["gloo"]
+
+    # 4. World PG re-initialization invalidates stale guard without calling new_group
+    fake_group.WORLD = world_pg_2
+    refreshed = dmod.get_default_dispatch_guard()
+    assert refreshed is not eager_guard
+    assert refreshed.process_group is None
+    assert calls == ["gloo"]
+
+    # 5. Caller-supplied PG and opt-in create_pg=True work cleanly
+    custom_pg = object()
+    custom_guard = dmod.init_default_dispatch_guard(process_group=custom_pg)
+    assert custom_guard is not None and custom_guard.process_group is custom_pg
+    assert calls == ["gloo"]
+
+    dmod.reset_default_dispatch_guard()
+    opt_in = dmod.get_default_dispatch_guard(create_pg=True)
+    assert opt_in is not None and opt_in.process_group is sentinel_pg
+    assert calls == ["gloo", "gloo"]
+    dmod.reset_default_dispatch_guard()
+
+
+def test_dispatch_guard_scope_reentrancy_and_autotuner_integration():
+    import triton.runtime._distributed as dmod
+
+    assert not dmod.is_in_dispatch_guard_scope()
+    barriers = []
+    guard = DistributedDispatchGuard(
+        world_size=2,
+        rank=0,
+        all_reduce_or_fn=lambda m: m,
+        barrier_fn=lambda: barriers.append(1),
+    )
+
+    # 1. Nested coordinate() inside coordinate() negotiates and syncs strictly once
+    with guard.coordinate(RankDispatchState.ANY_COLD_COMPILE) as outer_dec:
+        assert dmod.is_in_dispatch_guard_scope()
+        assert outer_dec is not None and outer_dec.extend_collective_window
+        with guard.coordinate(RankDispatchState.ALL_HOT_HIT) as inner_dec:
+            assert inner_dec is None
+            assert dmod.is_in_dispatch_guard_scope()
+    assert not dmod.is_in_dispatch_guard_scope()
+    assert guard.negotiation_count == 1
+    assert len(barriers) == 2
+
+    # 2. Exception safety: post_compile_sync still runs in finally and scope resets
+    barriers.clear()
+    try:
+        with guard.coordinate(RankDispatchState.ANY_COLD_COMPILE):
+            raise RuntimeError("simulated compile failure")
+    except RuntimeError:
+        pass
+    assert not dmod.is_in_dispatch_guard_scope()
+    assert guard.negotiation_count == 2
+    assert len(barriers) == 2
+
+    # 3. Autotuner skips duplicate negotiation inside outer dispatch_guard_scope()
+    barriers.clear()
+    tuner = Autotuner(
+        _MiniJIT(),
+        ["X", "N", "BLOCK"],
+        [Config({"BLOCK": 64}), Config({"BLOCK": 128})],
+        ["N"],
+        reset_to_zero=None,
+        restore_value=None,
+        do_bench=lambda fn_call, quantiles=None: [0.1, 0.1, 0.1],
+        cache_results=False,
+    )
+    tuner.dispatch_guard = guard
+    dummy_x = SimpleNamespace(dtype="torch.bfloat16", data_ptr=lambda: 4096)
+
+    with knobs.autotuning.scope():
+        knobs.autotuning.adjust_block_size = False
+        knobs.autotuning.shape_bucketing = True
+        # Guard OFF -> zero collectives
+        knobs.autotuning.distributed_dispatch_guard = False
+        tuner.run(dummy_x, 128)
+        assert guard.negotiation_count == 2
+        assert len(barriers) == 0
+
+        # Guard ON inside outer scope -> nested Autotuner skips duplicate negotiate
+        knobs.autotuning.distributed_dispatch_guard = True
+        with dmod.dispatch_guard_scope():
+            tuner.run(dummy_x, 256)
+        assert guard.negotiation_count == 2
+        assert len(barriers) == 0
+
+        # Guard ON standalone (cold miss) -> Autotuner negotiates + 2 barriers
+        tuner.run(dummy_x, 512)
+        assert guard.negotiation_count == 3
+        assert len(barriers) == 2
+
+        # Guard ON standalone (warm hit) -> negotiates ALL_HOT_HIT with 0 new barriers
+        tuner.run(dummy_x, 512)
+        assert guard.negotiation_count == 4
+        assert len(barriers) == 2
+
+
+def test_two_rank_gloo_asymmetric_get_default_dispatch_guard_no_deadlock():
+    import subprocess
+
+    try:
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_gloo_available()):
+            return
+    except Exception:
+        return
+
+    worker_code = (
+        "import datetime, os, sys, time, torch.distributed as dist\n"
+        "from triton.runtime import _distributed as dmod\n"
+        "rank = int(sys.argv[1])\n"
+        "init_file = sys.argv[2]\n"
+        "done_file = sys.argv[3]\n"
+        "dist.init_process_group("
+        "backend='gloo', init_method=f'file://{init_file}', "
+        "rank=rank, world_size=2, timeout=datetime.timedelta(seconds=6))\n"
+        "try:\n"
+        "    dist.barrier()\n"
+        "    if rank == 0:\n"
+        "        t0 = time.monotonic()\n"
+        "        while not os.path.exists(done_file):\n"
+        "            assert time.monotonic() - t0 < 5.0, 'rank 1 hung'\n"
+        "            time.sleep(0.02)\n"
+        "    else:\n"
+        "        t0 = time.monotonic()\n"
+        "        g = dmod.get_default_dispatch_guard()\n"
+        "        assert g is not None and g.process_group is None\n"
+        "        assert time.monotonic() - t0 < 2.0\n"
+        "        open(done_file, 'w').write('ok')\n"
+        "    dist.barrier()\n"
+        "    eg = dmod.init_default_dispatch_guard(create_gloo_group=True)\n"
+        "    assert eg is not None and eg.process_group is not None\n"
+        "    st = (dmod.RankDispatchState.ALL_HOT_HIT if rank == 0 "
+        "else dmod.RankDispatchState.ANY_COLD_COMPILE)\n"
+        "    with eg.coordinate(st) as dec:\n"
+        "        assert dec is not None and dec.extend_collective_window\n"
+        "    dmod.reset_default_dispatch_guard()\n"
+        "finally:\n"
+        "    dist.destroy_process_group()\n"
+    )
+    with tempfile.TemporaryDirectory(prefix="ft_gloo_guard_test_") as tmpd:
+        init_f = os.path.join(tmpd, "rdv")
+        done_f = os.path.join(tmpd, "r1_done")
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", worker_code, str(r), init_f, done_f],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for r in (0, 1)
+        ]
+        for r, p in enumerate(procs):
+            out, err = p.communicate(timeout=15)
+            assert p.returncode == 0, f"rank {r} failed ({p.returncode}):\n{out}\n{err}"

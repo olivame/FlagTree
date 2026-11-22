@@ -1257,7 +1257,8 @@ def adjust_block_size_tma(nargs, current, config, desc_name, bs_names):
     if len(desc_base.shape) != len(bs_names):
         if knobs.autotuning.print:
             print(
-                f"[AABS] Warning: len(desc_base.shape)={len(desc_base.shape)} != {len(bs_names)}=len(bs_names), bs_names={bs_names}"
+                f"[AABS] Warning: len(desc_base.shape)={len(desc_base.shape)} "
+                f"!= {len(bs_names)}=len(bs_names), bs_names={bs_names}"
             )
         return
     for shape_size, bs_name in zip(desc_base.shape, bs_names):
@@ -1621,7 +1622,11 @@ def _collect_extended_ast_signals(
         for sub in ast.walk(addr_node):
             if isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Mult):
                 for side, other in ((sub.left, sub.right), (sub.right, sub.left)):
-                    if isinstance(side, ast.Name) and side.id in analyzer.input_params and side.id not in analyzer.constexpr_params:
+                    if (
+                        isinstance(side, ast.Name)
+                        and side.id in analyzer.input_params
+                        and side.id not in analyzer.constexpr_params
+                    ):
                         cand = side.id
                         if _is_spatial_conv_param(cand):
                             invariants.add(cand)
@@ -1631,7 +1636,10 @@ def _collect_extended_ast_signals(
                         is_offset_mult = _looks_like_memory_stride(cand)
                         if not is_offset_mult:
                             for ov in other_vars:
-                                if analyzer._extract_arange_bs_recursive(ov) or ov.startswith(("pid", "off", "rm", "rn", "rk", "row", "col", "batch", "head")):
+                                _offset_prefixes = (
+                                    "pid", "off", "rm", "rn", "rk", "row", "col", "batch", "head"
+                                )
+                                if analyzer._extract_arange_bs_recursive(ov) or ov.startswith(_offset_prefixes):
                                     is_offset_mult = True
                                     break
                         if is_offset_mult and cand not in dim_to_blocks:
@@ -1659,7 +1667,10 @@ def _collect_extended_ast_signals(
         elif isinstance(node, ast.For):
             it = node.iter
             if isinstance(it, ast.Call) and len(it.args) >= 3:
-                is_range = (isinstance(it.func, ast.Name) and it.func.id == "range") or analyzer._is_tl_func(it, "range")
+                is_range = (
+                    (isinstance(it.func, ast.Name) and it.func.id == "range")
+                    or analyzer._is_tl_func(it, "range")
+                )
                 if is_range:
                     in_dims = _resolve_inputs(it.args[1])
                     ce_blks = _resolve_constexprs(it.args[2])
@@ -1719,9 +1730,21 @@ def _collect_extended_ast_signals(
                     if kw.arg:
                         bound[kw.arg] = kw.value
                 base_p = analyzer._find_tensor_base(bound["base"]) if "base" in bound else None
-                shape_elts = bound["shape"].elts if ("shape" in bound and isinstance(bound["shape"], (ast.Tuple, ast.List))) else []
-                bshape_elts = bound["block_shape"].elts if ("block_shape" in bound and isinstance(bound["block_shape"], (ast.Tuple, ast.List))) else []
-                stride_elts = bound["strides"].elts if ("strides" in bound and isinstance(bound["strides"], (ast.Tuple, ast.List))) else []
+                shape_elts = (
+                    bound["shape"].elts
+                    if ("shape" in bound and isinstance(bound["shape"], (ast.Tuple, ast.List)))
+                    else []
+                )
+                bshape_elts = (
+                    bound["block_shape"].elts
+                    if ("block_shape" in bound and isinstance(bound["block_shape"], (ast.Tuple, ast.List)))
+                    else []
+                )
+                stride_elts = (
+                    bound["strides"].elts
+                    if ("strides" in bound and isinstance(bound["strides"], (ast.Tuple, ast.List)))
+                    else []
+                )
                 for s_el, b_el in zip(shape_elts, bshape_elts):
                     if isinstance(s_el, ast.Name) and isinstance(b_el, ast.Name):
                         if s_el.id == b_el.id:
@@ -1731,7 +1754,11 @@ def _collect_extended_ast_signals(
                             if base_p:
                                 tensor_base_to_dims.setdefault(base_p, set()).add(s_el.id)
                 for st_el in stride_elts:
-                    if isinstance(st_el, ast.Name) and st_el.id in analyzer.input_params and st_el.id not in analyzer.constexpr_params:
+                    if (
+                        isinstance(st_el, ast.Name)
+                        and st_el.id in analyzer.input_params
+                        and st_el.id not in analyzer.constexpr_params
+                    ):
                         if not _is_spatial_conv_param(st_el.id):
                             stride_params.add(st_el.id)
                             if base_p:
@@ -1787,7 +1814,10 @@ def _collect_extended_ast_signals(
                             for h_st in sub_sig["stride_params"]:
                                 act_st_node = formal_to_actual.get(h_st)
                                 if isinstance(act_st_node, ast.Name) and act_st_node.id in analyzer.input_params:
-                                    if act_st_node.id not in analyzer.constexpr_params and not _is_spatial_conv_param(act_st_node.id):
+                                    if (
+                                        act_st_node.id not in analyzer.constexpr_params
+                                        and not _is_spatial_conv_param(act_st_node.id)
+                                    ):
                                         stride_params.add(act_st_node.id)
 
                             for h_inv in sub_sig["invariants"]:
@@ -1795,11 +1825,19 @@ def _collect_extended_ast_signals(
                                 if isinstance(act_inv_node, ast.Name) and act_inv_node.id in analyzer.constexpr_params:
                                     invariants.add(act_inv_node.id)
 
-        elif isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], (ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+        elif (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], (ast.Lt, ast.LtE, ast.Gt, ast.GtE))
+        ):
             # Catch standalone boundary checks like `mask = n_offsets < N` even before load
             left, right = node.left, node.comparators[0]
             for ar_side, x_side in ((left, right), (right, left)):
-                if isinstance(x_side, ast.Name) and x_side.id in analyzer.input_params and x_side.id not in analyzer.constexpr_params:
+                if (
+                    isinstance(x_side, ast.Name)
+                    and x_side.id in analyzer.input_params
+                    and x_side.id not in analyzer.constexpr_params
+                ):
                     if _looks_like_memory_stride(x_side.id) or _is_spatial_conv_param(x_side.id):
                         continue
                     bs_set = set(analyzer._extract_arange_bs(ar_side))

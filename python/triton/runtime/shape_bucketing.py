@@ -797,7 +797,11 @@ def _extract_callable_ast(fn: Callable[..., Any]) -> Optional[Tuple[ast.AST, str
                 for node in ast.walk(tree):
                     if isinstance(node, ast.FunctionDef) and node.name == getattr(fn, "__name__", ""):
                         arg_name = node.args.args[0].arg if node.args.args else "args"
-                        if len(node.body) == 1 and isinstance(node.body[0], ast.Return) and node.body[0].value is not None:
+                        if (
+                            len(node.body) == 1
+                            and isinstance(node.body[0], ast.Return)
+                            and node.body[0].value is not None
+                        ):
                             parsed = (node.body[0].value, arg_name, closure_ns)
                         else:
                             parsed = (node, arg_name, closure_ns)

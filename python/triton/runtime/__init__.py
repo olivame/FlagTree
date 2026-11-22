@@ -39,6 +39,11 @@ from ._distributed import (
     OOMRecoveryController,
     PerfRiskLevel,
     RankDispatchState,
+    dispatch_guard_scope,
+    get_default_dispatch_guard,
+    init_default_dispatch_guard,
+    is_in_dispatch_guard_scope,
+    reset_default_dispatch_guard,
 )
 from ._async_compile import GLOBAL_COMPILE_BLACKLIST, run_with_compile_timeout
 from .shape_bucketing import (
@@ -84,6 +89,11 @@ __all__ = [
     "OOMRecoveryController",
     "PerfRiskLevel",
     "RankDispatchState",
+    "dispatch_guard_scope",
+    "get_default_dispatch_guard",
+    "init_default_dispatch_guard",
+    "is_in_dispatch_guard_scope",
+    "reset_default_dispatch_guard",
     "run_with_compile_timeout",
     # flagtree online shape bucketing
     "BucketCacheBudget",

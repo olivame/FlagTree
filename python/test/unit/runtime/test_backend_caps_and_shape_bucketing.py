@@ -220,7 +220,11 @@ def test_interval_policy_delegates_online_helpers(tmp_path):
 
     pol = IntervalPolicy(
         dynamic_axis="M",
-        groups={"N=512::dtypes=bf16": [IntervalSegment(lo=1, hi=256, config_index=0, representative=128, regret_ms=0.01)]},
+        groups={
+            "N=512::dtypes=bf16": [
+                IntervalSegment(lo=1, hi=256, config_index=0, representative=128, regret_ms=0.01)
+            ]
+        },
         backend="ppu",
     )
     pol.observe_args({"M": 64, "N": 512})

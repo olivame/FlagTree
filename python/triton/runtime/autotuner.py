@@ -79,7 +79,8 @@ class Autotuner(KernelInterface):
             'perf_model': performance model used to predicate running time with different configs, returns running time
             'top_k': number of configs to bench
             'early_config_prune': a function used to prune configs. It should have the signature
-                `prune_configs_by( configs: List[triton.Config], named_args: Dict[str, Any], **kwargs: Dict[str, Any]) -> List[triton.Config]:`
+                `prune_configs_by( configs: List[triton.Config], named_args: Dict[str, Any],`
+                `**kwargs: Dict[str, Any]) -> List[triton.Config]:`
                 and return pruned configs. It should return at least one config.
         """
         default_stages = 2 if generate_configs is not None else 3
@@ -465,46 +466,66 @@ class Autotuner(KernelInterface):
 
             _dist_guard = None
             _dist_decision = None
+            _dist_scope_cm = None
             if getattr(knobs.autotuning, "distributed_dispatch_guard", False):
-                from ._distributed import RankDispatchState, get_default_dispatch_guard
-                _dist_guard = getattr(self, "dispatch_guard", None) or get_default_dispatch_guard()
-                if _dist_guard is not None:
-                    _local_state = (
-                        RankDispatchState.ANY_COLD_COMPILE
-                        if key not in self.cache
-                        else RankDispatchState.ALL_HOT_HIT
-                    )
-                    _dist_decision = _dist_guard.negotiate(_local_state)
+                from ._distributed import (
+                    RankDispatchState,
+                    dispatch_guard_scope,
+                    get_default_dispatch_guard,
+                    is_in_dispatch_guard_scope,
+                )
+                if not is_in_dispatch_guard_scope():
+                    _dist_guard = getattr(self, "dispatch_guard", None) or get_default_dispatch_guard()
+                    if _dist_guard is not None:
+                        _local_state = (
+                            RankDispatchState.ANY_COLD_COMPILE
+                            if key not in self.cache
+                            else RankDispatchState.ALL_HOT_HIT
+                        )
+                        _dist_decision = _dist_guard.negotiate(_local_state)
+                        _dist_scope_cm = dispatch_guard_scope()
+                        _dist_scope_cm.__enter__()
 
-            if key not in self.cache:
-                if len(self.configs) <= 1:
-                    self.cache[key] = self.configs[0]
-                else:
-                    used_cached_result = False
-                    pruned_configs = self.prune_configs(kwargs)
-
-                    def benchmark():
-                        bench_start = time.time()
-                        timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
-                        bench_end = time.time()
-                        self.bench_time = bench_end - bench_start
-                        self.cache[key] = builtins.min(timings, key=timings.get)
-                        full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
-                        self.pre_hook(full_nargs, reset_only=True)
-                        self.configs_timings = timings
-
-                    if self.cache_results:
-                        used_cached_result = self.check_disk_cache(key, pruned_configs, benchmark)
+            try:
+                if key not in self.cache:
+                    if len(self.configs) <= 1:
+                        self.cache[key] = self.configs[0]
                     else:
-                        benchmark()
-            if _dist_guard is not None and _dist_decision is not None:
-                _dist_guard.post_compile_sync(_dist_decision)
+                        used_cached_result = False
+                        pruned_configs = self.prune_configs(kwargs)
+
+                        def benchmark():
+                            bench_start = time.time()
+                            timings = {
+                                config: self._bench(*args, config=config, **kwargs)
+                                for config in pruned_configs
+                            }
+                            bench_end = time.time()
+                            self.bench_time = bench_end - bench_start
+                            self.cache[key] = builtins.min(timings, key=timings.get)
+                            full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
+                            self.pre_hook(full_nargs, reset_only=True)
+                            self.configs_timings = timings
+
+                        if self.cache_results:
+                            used_cached_result = self.check_disk_cache(key, pruned_configs, benchmark)
+                        else:
+                            benchmark()
+            finally:
+                if _dist_scope_cm is not None:
+                    _dist_scope_cm.__exit__(None, None, None)
+                if _dist_guard is not None and _dist_decision is not None:
+                    _dist_guard.post_compile_sync(_dist_decision)
 
             config = self.cache[key]
             if bucketing_enabled and lookup is not None:
                 if guard_mismatch:
                     eff_status = DispatchStatus.GUARD_MISMATCH
-                elif lookup.status in (DispatchStatus.UNDERFLOW, DispatchStatus.OVERFLOW, DispatchStatus.GUARD_MISMATCH):
+                elif lookup.status in (
+                    DispatchStatus.UNDERFLOW,
+                    DispatchStatus.OVERFLOW,
+                    DispatchStatus.GUARD_MISMATCH,
+                ):
                     eff_status = lookup.status
                 elif not used_cached_result:
                     eff_status = DispatchStatus.COLD_TUNED
@@ -713,7 +734,8 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
         'perf_model': performance model used to predicate running time with different configs, returns running time
         'top_k': number of configs to bench
         'early_config_prune': a function used to prune configs. It should have the signature
-                `prune_configs_by( configs: List[triton.Config], named_args: Dict[str, Any], **kwargs: Dict[str, Any]) -> List[triton.Config]:`
+                `prune_configs_by( configs: List[triton.Config], named_args: Dict[str, Any],`
+                `**kwargs: Dict[str, Any]) -> List[triton.Config]:`
                 and return pruned configs. It should return at least one config.
     :param reset_to_zero: a list of argument names whose value will be reset to zero before evaluating any configs.
     :type reset_to_zero: list[str]
@@ -722,7 +744,8 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     :param pre_hook: a function that will be called before the kernel is called.
         This overrides the default pre_hook used for 'reset_to_zero' and 'restore_value'.
         'kwargs': a dict of all arguments passed to the kernel.
-        'reset_only': a boolean indicating whether the pre_hook is called to reset the values only, without a corresponding post_hook.
+        'reset_only': a boolean indicating whether the pre_hook is called to reset the values only,
+        without a corresponding post_hook.
     :type pre_hook: lambda args, reset_only
     :param post_hook: a function that will be called after the kernel is called.
         This overrides the default post_hook used for 'restore_value'.

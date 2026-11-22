@@ -166,9 +166,21 @@ class CollectiveCostModel:
     ) -> None:
         default_curve = PiecewiseAlphaBetaCurve(
             (
-                AlphaBetaSegment(max_bytes=64 * 1024, alpha_us=base_latency_us, bandwidth_gbps=intra_node_bandwidth_gbps * 0.35),
-                AlphaBetaSegment(max_bytes=4 * 1024 * 1024, alpha_us=base_latency_us * 1.5, bandwidth_gbps=intra_node_bandwidth_gbps * 0.78),
-                AlphaBetaSegment(max_bytes=1 << 60, alpha_us=base_latency_us * 2.2, bandwidth_gbps=intra_node_bandwidth_gbps),
+                AlphaBetaSegment(
+                    max_bytes=64 * 1024,
+                    alpha_us=base_latency_us,
+                    bandwidth_gbps=intra_node_bandwidth_gbps * 0.35,
+                ),
+                AlphaBetaSegment(
+                    max_bytes=4 * 1024 * 1024,
+                    alpha_us=base_latency_us * 1.5,
+                    bandwidth_gbps=intra_node_bandwidth_gbps * 0.78,
+                ),
+                AlphaBetaSegment(
+                    max_bytes=1 << 60,
+                    alpha_us=base_latency_us * 2.2,
+                    bandwidth_gbps=intra_node_bandwidth_gbps,
+                ),
             )
         )
         self._curves: Dict[CollectiveKind, PiecewiseAlphaBetaCurve] = {
@@ -739,7 +751,11 @@ class PartitionPlanner:
                     req_batch_ms = ttft_ms + out_len * tpot_ms
                     tokens_per_batch = b * (s_pre + out_len)
                     comp_total = model.num_layers * (pre_comp_ms + out_len * dec_comp_ms)
-                    exp_comm_total = model.num_layers * (pre_exp_comm_ms + out_len * dec_exp_comm_ms) + pp_p2p_ms + out_len * dec_p2p_ms
+                    exp_comm_total = (
+                        model.num_layers * (pre_exp_comm_ms + out_len * dec_exp_comm_ms)
+                        + pp_p2p_ms
+                        + out_len * dec_p2p_ms
+                    )
                 else:
                     tpot_ms = 0.0
                     req_batch_ms = ttft_ms / (1.0 - bubble_ratio * 0.5)
@@ -952,7 +968,16 @@ class PartitionPlanner:
                     raw_comm_ms += ep_comm
                     exposed_comm_ms += ep_comm
 
-                if strat in (ParallelStrategyKind.DDP, ParallelStrategyKind.HYBRID_DP_TP, ParallelStrategyKind.HYBRID_3D, ParallelStrategyKind.EXPERT_PARALLEL) and dp_eff > 1:
+                if (
+                    strat
+                    in (
+                        ParallelStrategyKind.DDP,
+                        ParallelStrategyKind.HYBRID_DP_TP,
+                        ParallelStrategyKind.HYBRID_3D,
+                        ParallelStrategyKind.EXPERT_PARALLEL,
+                    )
+                    and dp_eff > 1
+                ):
                     total_grad_bytes = sharded_params * model.dtype_bytes
                     bucket_bytes = max(1024 * 1024, int(constraints.ddp_bucket_cap_mb * 1024 * 1024))
                     num_buckets = max(1, math.ceil(total_grad_bytes / float(bucket_bytes)))
@@ -1126,7 +1151,10 @@ class PartitionPlanner:
                     use_tle_overlap=False,
                     devices_used=ndev if strat is not ParallelStrategyKind.SINGLE_DEVICE else 1,
                     per_device_memory_bytes=mem_total,
-                    memory_breakdown_bytes={"weights_and_tables": int(per_dev_w * mem_mult), "activations": int(act_b // max(1, pp))},
+                    memory_breakdown_bytes={
+                        "weights_and_tables": int(per_dev_w * mem_mult),
+                        "activations": int(act_b // max(1, pp)),
+                    },
                     fits_memory=fits_mem,
                     meets_sla=meets_sla,
                     step_latency_ms=step_ms,

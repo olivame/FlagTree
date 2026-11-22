@@ -214,6 +214,7 @@ def validate_node_launch_bindings(kernel, bound_args, specialization):
 # Multi-Rank Dispatch Coordination, OOM Recovery & Fallback Risk Guard
 # =====================================================================
 
+import contextlib
 from dataclasses import asdict, dataclass
 from enum import Enum, IntFlag
 import json
@@ -221,7 +222,7 @@ import logging
 from pathlib import Path
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .errors import OutOfResources
 
@@ -350,6 +351,25 @@ class CoordinatedDispatchDecision:
     barrier_completed: bool
 
 
+_DISPATCH_GUARD_SCOPE_LOCAL = threading.local()
+
+
+def is_in_dispatch_guard_scope() -> bool:
+    """Return True when the current thread is already inside a dispatch guard scope."""
+    return getattr(_DISPATCH_GUARD_SCOPE_LOCAL, "depth", 0) > 0
+
+
+@contextlib.contextmanager
+def dispatch_guard_scope() -> Iterator[None]:
+    """Re-entrant thread-local scope preventing duplicate nested guard collectives."""
+    depth = getattr(_DISPATCH_GUARD_SCOPE_LOCAL, "depth", 0)
+    _DISPATCH_GUARD_SCOPE_LOCAL.depth = depth + 1
+    try:
+        yield
+    finally:
+        _DISPATCH_GUARD_SCOPE_LOCAL.depth = depth
+
+
 class DistributedDispatchGuard:
     """Synchronize bucket/compile/fallback states across DDP/FSDP/TP/EP ranks.
 
@@ -439,7 +459,12 @@ class DistributedDispatchGuard:
         merged = RankDispatchState(self._reduce_bitmask(int(local_state)))
         all_hot = merged is RankDispatchState.ALL_HOT_HIT
         need_window = bool(
-            merged & (RankDispatchState.ANY_COLD_COMPILE | RankDispatchState.ANY_OOM_RETRY | RankDispatchState.ANY_TIMEOUT)
+            merged
+            & (
+                RankDispatchState.ANY_COLD_COMPILE
+                | RankDispatchState.ANY_OOM_RETRY
+                | RankDispatchState.ANY_TIMEOUT
+            )
         )
         agreed_fb = bool(merged & RankDispatchState.ANY_FALLBACK)
         did_barrier = False
@@ -462,40 +487,141 @@ class DistributedDispatchGuard:
             return self._run_barrier()
         return False
 
+    @contextlib.contextmanager
+    def coordinate(
+        self, local_state: RankDispatchState
+    ) -> Iterator[Optional[CoordinatedDispatchDecision]]:
+        """Negotiate once at an outer dispatch boundary and sync on exit.
+
+        Nested invocations inside an active :func:`dispatch_guard_scope` yield
+        ``None`` without issuing duplicate collectives. ``post_compile_sync``
+        always executes in ``finally`` so peer ranks never hang on compile errors.
+        """
+        if is_in_dispatch_guard_scope():
+            yield None
+            return
+        decision = self.negotiate(local_state)
+        try:
+            with dispatch_guard_scope():
+                yield decision
+        finally:
+            self.post_compile_sync(decision)
+
 
 _DEFAULT_GUARD_LOCK = threading.Lock()
 _DEFAULT_DISPATCH_GUARD: Optional[DistributedDispatchGuard] = None
+_DEFAULT_DISPATCH_WORLD_PG: Any = None
 
 
-def get_default_dispatch_guard() -> Optional[DistributedDispatchGuard]:
-    """Return a shared DistributedDispatchGuard when torch.distributed is active (world_size > 1)."""
-    global _DEFAULT_DISPATCH_GUARD
+def _get_active_dist_context():
+    """Return ``(dist, world_size, rank, world_pg)`` when active (ws > 1), else None."""
     try:
         import torch.distributed as dist
+
         if not (dist.is_available() and dist.is_initialized()):
             return None
         ws = dist.get_world_size()
         if ws <= 1:
             return None
         rk = dist.get_rank()
+        world_pg = getattr(getattr(dist, "group", None), "WORLD", None)
+        return dist, ws, rk, world_pg
     except Exception:
         return None
+
+
+def reset_default_dispatch_guard() -> None:
+    """Reset the cached default DistributedDispatchGuard singleton."""
+    global _DEFAULT_DISPATCH_GUARD, _DEFAULT_DISPATCH_WORLD_PG
     with _DEFAULT_GUARD_LOCK:
-        if _DEFAULT_DISPATCH_GUARD is None or _DEFAULT_DISPATCH_GUARD.world_size != ws or _DEFAULT_DISPATCH_GUARD.rank != rk:
+        _DEFAULT_DISPATCH_GUARD = None
+        _DEFAULT_DISPATCH_WORLD_PG = None
+
+
+def init_default_dispatch_guard(
+    process_group: Any = None,
+    create_gloo_group: bool = True,
+    *,
+    backend: Optional[str] = None,
+    timeout: Any = None,
+) -> Optional[DistributedDispatchGuard]:
+    """Eagerly initialize the shared DistributedDispatchGuard across ranks.
+
+    When ``process_group`` is None and ``create_gloo_group`` is True, this
+    collectively creates a dedicated side-channel ``gloo`` ProcessGroup via
+    ``dist.new_group`` and MUST be called by all ranks (e.g. immediately after
+    ``torch.distributed.init_process_group``).
+    """
+    global _DEFAULT_DISPATCH_GUARD, _DEFAULT_DISPATCH_WORLD_PG
+    ctx = _get_active_dist_context()
+    if ctx is None:
+        return None
+    dist, ws, rk, world_pg = ctx
+
+    pg = process_group
+    if pg is None and create_gloo_group:
+        ng_kwargs: Dict[str, Any] = {}
+        if timeout is not None:
+            ng_kwargs["timeout"] = timeout
+        try:
+            if backend is not None:
+                pg = dist.new_group(backend=backend, **ng_kwargs)
+            elif getattr(dist, "is_gloo_available", lambda: False)():
+                pg = dist.new_group(backend="gloo", **ng_kwargs)
+            else:
+                pg = dist.new_group(**ng_kwargs)
+        except Exception:
             pg = None
-            try:
-                if dist.is_gloo_available():
-                    pg = dist.new_group(backend="gloo")
-                else:
-                    pg = dist.new_group()
-            except Exception:
-                pg = None
+
+    with _DEFAULT_GUARD_LOCK:
+        _DEFAULT_DISPATCH_GUARD = DistributedDispatchGuard(
+            world_size=ws,
+            rank=rk,
+            process_group=pg,
+        )
+        _DEFAULT_DISPATCH_WORLD_PG = world_pg
+        return _DEFAULT_DISPATCH_GUARD
+
+
+def get_default_dispatch_guard(*, create_pg: bool = False) -> Optional[DistributedDispatchGuard]:
+    """Return a shared DistributedDispatchGuard when torch.distributed is active (ws > 1).
+
+    Strictly non-collective by default (``create_pg=False``): returns the guard
+    eagerly registered by :func:`init_default_dispatch_guard` if present, or
+    lazily binds to the already-initialized default ProcessGroup
+    (``process_group=None``) without calling ``dist.new_group()``.
+    """
+    global _DEFAULT_DISPATCH_GUARD, _DEFAULT_DISPATCH_WORLD_PG
+    ctx = _get_active_dist_context()
+    if ctx is None:
+        return None
+    _, ws, rk, world_pg = ctx
+
+    with _DEFAULT_GUARD_LOCK:
+        guard = _DEFAULT_DISPATCH_GUARD
+        stale = (
+            guard is None
+            or guard.world_size != ws
+            or guard.rank != rk
+            or (
+                world_pg is not None
+                and _DEFAULT_DISPATCH_WORLD_PG is not None
+                and _DEFAULT_DISPATCH_WORLD_PG is not world_pg
+            )
+        )
+        if not stale:
+            if not (create_pg and guard.process_group is None):
+                return guard
+        elif not create_pg:
             _DEFAULT_DISPATCH_GUARD = DistributedDispatchGuard(
                 world_size=ws,
                 rank=rk,
-                process_group=pg,
+                process_group=None,
             )
-        return _DEFAULT_DISPATCH_GUARD
+            _DEFAULT_DISPATCH_WORLD_PG = world_pg
+            return _DEFAULT_DISPATCH_GUARD
+
+    return init_default_dispatch_guard(create_gloo_group=True)
 
 
 def _is_oom_exception(exc: BaseException) -> bool:

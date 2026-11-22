@@ -134,7 +134,9 @@ class DependenciesFinder(ast.NodeVisitor):
             v2, _ = func.used_global_vals[k]
             if v1 != v2:
                 raise RuntimeError(
-                    f"Global variable {var_name} has value {v1} when compiling {self.name}, but inner kernel {func.__name__} has conflicting value {v2} from when it was first compiled.  This is not allowed."
+                    f"Global variable {var_name} has value {v1} when compiling {self.name}, "
+                    f"but inner kernel {func.__name__} has conflicting value {v2} from when "
+                    "it was first compiled.  This is not allowed."
                 )
         self.used_global_vals.update(func.used_global_vals)
         # update hash
@@ -599,7 +601,8 @@ class JITCallable:
         The only method allowed to modify src.
         Bypasses the __setattr__ restriction by calling super().__setattr__ directly.
 
-        Note that it is the callers responsibility to make sure any triton functions that call this function have the `.hash` value reset to None.
+        Note that it is the callers responsibility to make sure any triton functions
+        that call this function have the `.hash` value reset to None.
         """
         self.hash = None
         self._src = new_src
@@ -700,7 +703,11 @@ class JITFunction(JITCallable, KernelInterface[T]):
         name = self.fn.__qualname__
         module = self.fn.__module__
         arg_reprs = ", ".join([f"{param.name}: {ty}" for param, ty in zip(self.params, key[1])])
-        repr = f"{name}[num_warps={options.num_warps}, num_ctas={options.num_ctas}, num_stages={options.num_stages}, enable_fp_fusion={options.enable_fp_fusion}, launch_cooperative_grid={options.launch_cooperative_grid}]({arg_reprs})"
+        repr = (
+            f"{name}[num_warps={options.num_warps}, num_ctas={options.num_ctas}, "
+            f"num_stages={options.num_stages}, enable_fp_fusion={options.enable_fp_fusion}, "
+            f"launch_cooperative_grid={options.launch_cooperative_grid}]({arg_reprs})"
+        )
         full_name = get_full_name(self.fn)
 
         specialization_data = serialize_specialization_data(full_name, signature, constants, configs[0], options, key)
@@ -1249,7 +1256,8 @@ class ConstexprFunction(JITCallable):
         res = self.fn(*args, **kwargs)
 
         if _semantic is None:
-            # Not called by triton code generator, e.g. in host code, another constexpr function, or even an aggreate's __init__ function
+            # Not called by triton code generator, e.g. in host code,
+            # another constexpr function, or even an aggreate's __init__ function
             return res
 
         # convert result back to a Triton constexpr:
