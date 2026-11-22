@@ -177,6 +177,16 @@ cd ${ANY_DIR_OTHER_THAN_FLAGTREE_PYTHON}; python3 -c 'import triton; print(trito
 
 Refer to [User Manual](https://github.com/flagos-ai/FlagTree/wiki/User-Manual).
 
+## Dynamic Shape Bucketing & Parallel Runtime (F09)
+
+FlagTree includes an opt-in, backend-agnostic Dynamic Shape Bucketing, Distributed Dispatch Guard, OOM Recovery, and Offline Partition Planning runtime (`FLAGTREE_SHAPE_BUCKETING=1`, disabled by default):
+
+- **Overview & Quick Start (CN / EN)**: [docs/f09_shape_bucketing/README.md](docs/f09_shape_bucketing/README.md)
+- **Design, Backend Capability Contract & Maintenance Guide**: [docs/f09_shape_bucketing/DESIGN_AND_MAINTENANCE.md](docs/f09_shape_bucketing/DESIGN_AND_MAINTENANCE.md)
+- **Known Issues & Boundaries**: [docs/f09_shape_bucketing/KNOWN_ISSUES.md](docs/f09_shape_bucketing/KNOWN_ISSUES.md)
+- **F09 Changelog**: [docs/f09_shape_bucketing/CHANGELOG.md](docs/f09_shape_bucketing/CHANGELOG.md)
+- **Security Policy**: [SECURITY.md](SECURITY.md)
+
 ## Contributing
 
 Contributions to FlagTree development are welcome. Please refer to [CONTRIBUTING.md](/CONTRIBUTING.md) for details.
