@@ -20,12 +20,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from contextlib import contextmanager
 import json
 import os
 import shutil
+import threading
 import uuid
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import base64
 import hashlib
 import functools
@@ -33,7 +39,48 @@ import sysconfig
 
 from triton import __version__, knobs
 
+_CACHE_LOCK_FILENAME = ".flagtree_cache.lock"
+_CACHE_THREAD_LOCKS_GUARD = threading.Lock()
+_CACHE_THREAD_LOCKS: Dict[str, threading.RLock] = {}
 
+
+def _get_cache_thread_lock(cache_root: str) -> threading.RLock:
+    key = os.path.realpath(cache_root)
+    with _CACHE_THREAD_LOCKS_GUARD:
+        lock = _CACHE_THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _CACHE_THREAD_LOCKS[key] = lock
+        return lock
+
+
+@contextmanager
+def _cache_root_lock(cache_root: Optional[str], *, exclusive: bool = True) -> Iterator[None]:
+    """Inter-process POSIX ``fcntl.flock`` lock on ``cache_root`` with thread-lock fallback.
+
+    Warm cache hit reads (``has_file`` / ``get_file`` / ``get_group``) never call this
+    context manager and remain 100% lock-free.
+    """
+    if not cache_root:
+        yield
+        return
+    os.makedirs(cache_root, exist_ok=True)
+    tlock = _get_cache_thread_lock(cache_root)
+    with tlock:
+        if fcntl is None:
+            yield
+            return
+        lock_path = os.path.join(cache_root, _CACHE_LOCK_FILENAME)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+        try:
+            op = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(fd, op)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def enforce_binary_cache_budget(
@@ -46,7 +93,9 @@ def enforce_binary_cache_budget(
     """Evict oldest cache-key directories (including .hgbin/.cubin/.xpubin/.ttir/.json)
     when directory count or total size exceeds configured budget.
 
-    Never removes ``protect_key`` or active ``tmp.*`` staging directories.
+    Serialized across processes via ``_cache_root_lock(exclusive=True)`` so eviction
+    never races with concurrent ``FileCacheManager.put()`` writers. Never removes
+    ``protect_key`` or active ``tmp.*`` staging directories.
     """
     if not cache_root or not os.path.isdir(cache_root):
         return 0
@@ -55,57 +104,59 @@ def enforce_binary_cache_budget(
     if lim_entries is None and lim_bytes is None:
         return 0
 
-    candidates = []
-    total_size = 0
-    try:
-        with os.scandir(cache_root) as it:
-            for entry in it:
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                name = entry.name
-                if name.startswith("tmp."):
-                    continue
-                dir_size = 0
-                latest_mtime = 0.0
-                try:
-                    st_dir = entry.stat(follow_symlinks=False)
-                    latest_mtime = st_dir.st_mtime
-                    for root_d, _dirs, files in os.walk(entry.path):
-                        for fn in files:
-                            fp = os.path.join(root_d, fn)
-                            try:
-                                st = os.stat(fp)
-                                dir_size += st.st_size
-                                if st.st_mtime > latest_mtime:
-                                    latest_mtime = st.st_mtime
-                            except OSError:
-                                continue
-                except OSError:
-                    continue
-                total_size += dir_size
-                if name != protect_key:
-                    candidates.append((latest_mtime, dir_size, entry.path))
-    except OSError:
-        return 0
-
-    total_dirs = len(candidates) + (1 if protect_key and os.path.isdir(os.path.join(cache_root, protect_key)) else 0)
-    if (lim_entries is None or total_dirs <= lim_entries) and (lim_bytes is None or total_size <= lim_bytes):
-        return 0
-
-    candidates.sort(key=lambda item: item[0])
     evicted = 0
-    for _mtime, dsize, dpath in candidates:
-        need_entries = lim_entries is not None and total_dirs > lim_entries
-        need_bytes = lim_bytes is not None and total_size > lim_bytes
-        if not (need_entries or need_bytes):
-            break
+    with _cache_root_lock(cache_root, exclusive=True):
+        candidates = []
+        total_size = 0
         try:
-            shutil.rmtree(dpath, ignore_errors=False)
-            evicted += 1
-            total_dirs -= 1
-            total_size = max(0, total_size - dsize)
+            with os.scandir(cache_root) as it:
+                for entry in it:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    name = entry.name
+                    if name.startswith("tmp.") or name.startswith("."):
+                        continue
+                    dir_size = 0
+                    latest_mtime = 0.0
+                    try:
+                        st_dir = entry.stat(follow_symlinks=False)
+                        latest_mtime = st_dir.st_mtime
+                        for root_d, _dirs, files in os.walk(entry.path):
+                            for fn in files:
+                                fp = os.path.join(root_d, fn)
+                                try:
+                                    st = os.stat(fp)
+                                    dir_size += st.st_size
+                                    if st.st_mtime > latest_mtime:
+                                        latest_mtime = st.st_mtime
+                                except OSError:
+                                    continue
+                    except OSError:
+                        continue
+                    total_size += dir_size
+                    if name != protect_key:
+                        candidates.append((latest_mtime, dir_size, entry.path))
         except OSError:
-            continue
+            return 0
+
+        protect_exists = bool(protect_key and os.path.isdir(os.path.join(cache_root, protect_key)))
+        total_dirs = len(candidates) + (1 if protect_exists else 0)
+        if (lim_entries is None or total_dirs <= lim_entries) and (lim_bytes is None or total_size <= lim_bytes):
+            return 0
+
+        candidates.sort(key=lambda item: item[0])
+        for _mtime, dsize, dpath in candidates:
+            need_entries = lim_entries is not None and total_dirs > lim_entries
+            need_bytes = lim_bytes is not None and total_size > lim_bytes
+            if not (need_entries or need_bytes):
+                break
+            try:
+                shutil.rmtree(dpath, ignore_errors=False)
+                evicted += 1
+                total_dirs -= 1
+                total_size = max(0, total_size - dsize)
+            except OSError:
+                continue
 
     if evicted:
         try:
@@ -203,8 +254,9 @@ class FileCacheManager(CacheManager):
             max_entries = getattr(knobs.autotuning, "max_bucket_artifacts", None)
         max_bytes = knobs.cache.max_cache_bytes
         if max_entries is not None or max_bytes is not None:
+            cache_root = os.path.dirname(self.cache_dir) if self.cache_dir else knobs.cache.dir
             enforce_binary_cache_budget(
-                knobs.cache.dir,
+                cache_root,
                 max_entries=max_entries,
                 max_bytes=max_bytes,
                 protect_key=self.key,
@@ -231,18 +283,28 @@ class FileCacheManager(CacheManager):
         rnd_id = str(uuid.uuid4())
         # we use the PID in case a bunch of these around so we can see what PID made it
         pid = os.getpid()
-        # use temp dir to be robust against program interruptions
-        temp_dir = os.path.join(self.cache_dir, f"tmp.pid_{pid}_{rnd_id}")
-        os.makedirs(temp_dir, exist_ok=True)
-        temp_path = os.path.join(temp_dir, filename)
-
         mode = "wb" if binary else "w"
-        with open(temp_path, mode) as f:
-            f.write(data)
-        # Replace is guaranteed to be atomic on POSIX systems if it succeeds
-        # so filepath cannot see a partial write
-        os.replace(temp_path, filepath)
-        os.removedirs(temp_dir)
+        lock_root = None if (self._override or self._dump) else os.path.dirname(self.cache_dir)
+
+        with _cache_root_lock(lock_root, exclusive=False):
+            # Re-ensure cache_dir exists in case a prior eviction removed it before this write
+            os.makedirs(self.cache_dir, exist_ok=True)
+            # use temp dir to be robust against program interruptions
+            temp_dir = os.path.join(self.cache_dir, f"tmp.pid_{pid}_{rnd_id}")
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_path = os.path.join(temp_dir, filename)
+            try:
+                with open(temp_path, mode) as f:
+                    f.write(data)
+                # Replace is guaranteed to be atomic on POSIX systems if it succeeds
+                # so filepath cannot see a partial write
+                os.replace(temp_path, filepath)
+                try:
+                    os.utime(self.cache_dir, None)
+                except OSError:
+                    pass
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
         return filepath
 
 

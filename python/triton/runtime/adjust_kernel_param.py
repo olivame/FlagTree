@@ -1489,10 +1489,14 @@ _INVARIANT_EXACT_NAMES = frozenset({
 })
 
 
-def get_backend_min_dot_size(backend: str | None = None) -> tuple[int, int, int]:
+def get_backend_min_dot_size(
+    backend: str | None = None,
+    *,
+    dtype: object = None,
+) -> tuple[int, int, int]:
     """Return hardware ``(min_m, min_n, min_k)`` dot tile floor via backend capability registry."""
     from .backend_caps import get_backend_capabilities
-    return get_backend_capabilities(backend).min_dot_size
+    return get_backend_capabilities(backend).min_dot_size_for_dtype(dtype)
 
 
 def bucket_axes(**axis_roles: str):

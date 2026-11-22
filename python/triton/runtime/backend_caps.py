@@ -35,6 +35,16 @@ import threading
 from typing import Any, Callable, Dict, Optional, Tuple
 
 
+_FP8_DTYPE_MARKERS = ("fp8", "float8", "e4m3", "e5m2", "f8e4", "f8e5")
+
+
+def _is_fp8_dtype(dtype: Any) -> bool:
+    if dtype is None:
+        return False
+    norm = str(dtype).strip().lower()
+    return any(tok in norm for tok in _FP8_DTYPE_MARKERS)
+
+
 @dataclass(frozen=True)
 class BackendBucketingCapabilities:
     """Declarative hardware and compiler capabilities for one Triton backend."""
@@ -42,6 +52,7 @@ class BackendBucketingCapabilities:
     backend: str = "default"
     divisibility: int = 16
     min_dot_size: Tuple[int, int, int] = (16, 16, 16)
+    fp8_min_dot_size: Tuple[int, int, int] = (16, 16, 32)
     min_load_size: int = 1
     bakes_static_grid: bool = False
     default_num_stages: int = 3
@@ -49,6 +60,7 @@ class BackendBucketingCapabilities:
     candidate_generator_attr: str = "block_size_candidates"
     collective_device: Optional[str] = None
     collective_backends: Tuple[str, ...] = ()
+    torch_extension_module: Optional[str] = None
     graph_capture_apis: Tuple[Tuple[str, str, str], ...] = (
         ("npu", "NPUGraph", "graph"),
         ("cuda", "CUDAGraph", "graph"),
@@ -57,7 +69,16 @@ class BackendBucketingCapabilities:
         ("musa", "MUSAGraph", "graph"),
     )
     alignment_spec_tags: Tuple[str, ...] = ("D",)
+    extra_config_constexpr_keys: Tuple[str, ...] = ()
     supports_event_timing: bool = True
+    supports_cudagraph_bench: bool = True
+
+    def min_dot_size_for_dtype(self, dtype: Optional[Any] = None) -> Tuple[int, int, int]:
+        """Return hardware ``(min_m, min_n, min_k)`` dot floor, honoring FP8 ``K >= 32``."""
+        if _is_fp8_dtype(dtype):
+            fm, fn, fk = self.fp8_min_dot_size
+            return (int(fm), int(fn), max(32, int(fk)))
+        return self.min_dot_size
 
 
 _REGISTRY_LOCK = threading.Lock()
@@ -87,6 +108,7 @@ _DEFAULT_CAPABILITIES: Dict[str, BackendBucketingCapabilities] = {
         collective_device="cuda",
         collective_backends=("nccl", "rccl", "flagcx"),
         graph_capture_apis=(("cuda", "CUDAGraph", "graph"),),
+        extra_config_constexpr_keys=("waves_per_eu", "matrix_instr_nonkdim", "kpack"),
     ),
     "ppu": BackendBucketingCapabilities(
         backend="ppu",
@@ -95,6 +117,8 @@ _DEFAULT_CAPABILITIES: Dict[str, BackendBucketingCapabilities] = {
         collective_device="cuda",
         collective_backends=("nccl", "pccl", "flagcx"),
         graph_capture_apis=(("cuda", "CUDAGraph", "graph"),),
+        extra_config_constexpr_keys=("aiu_load_mask",),
+        supports_cudagraph_bench=False,
     ),
     "thead": BackendBucketingCapabilities(
         backend="thead",
@@ -103,6 +127,8 @@ _DEFAULT_CAPABILITIES: Dict[str, BackendBucketingCapabilities] = {
         collective_device="cuda",
         collective_backends=("nccl", "pccl", "flagcx"),
         graph_capture_apis=(("cuda", "CUDAGraph", "graph"),),
+        extra_config_constexpr_keys=("aiu_load_mask",),
+        supports_cudagraph_bench=False,
     ),
     "xpu": BackendBucketingCapabilities(
         backend="xpu",
@@ -134,6 +160,7 @@ _DEFAULT_CAPABILITIES: Dict[str, BackendBucketingCapabilities] = {
         min_dot_size=(16, 16, 16),
         collective_device="npu",
         collective_backends=("hccl", "flagcx"),
+        torch_extension_module="torch_npu",
         graph_capture_apis=(("npu", "NPUGraph", "graph"),),
     ),
     "cambricon": BackendBucketingCapabilities(
@@ -142,6 +169,7 @@ _DEFAULT_CAPABILITIES: Dict[str, BackendBucketingCapabilities] = {
         min_dot_size=(16, 16, 16),
         collective_device="mlu",
         collective_backends=("cncl", "flagcx"),
+        torch_extension_module="torch_mlu",
         graph_capture_apis=(("mlu", "MLUGraph", "graph"),),
     ),
     "mlu": BackendBucketingCapabilities(
@@ -150,22 +178,27 @@ _DEFAULT_CAPABILITIES: Dict[str, BackendBucketingCapabilities] = {
         min_dot_size=(16, 16, 16),
         collective_device="mlu",
         collective_backends=("cncl", "flagcx"),
+        torch_extension_module="torch_mlu",
         graph_capture_apis=(("mlu", "MLUGraph", "graph"),),
     ),
     "mthreads": BackendBucketingCapabilities(
         backend="mthreads",
         divisibility=16,
         min_dot_size=(64, 16, 16),
+        fp8_min_dot_size=(64, 16, 32),
         collective_device="musa",
         collective_backends=("mccl", "flagcx"),
+        torch_extension_module="torch_musa",
         graph_capture_apis=(("musa", "MUSAGraph", "graph"),),
     ),
     "musa": BackendBucketingCapabilities(
         backend="musa",
         divisibility=16,
         min_dot_size=(64, 16, 16),
+        fp8_min_dot_size=(64, 16, 32),
         collective_device="musa",
         collective_backends=("mccl", "flagcx"),
+        torch_extension_module="torch_musa",
         graph_capture_apis=(("musa", "MUSAGraph", "graph"),),
     ),
     "enflame": BackendBucketingCapabilities(
@@ -196,6 +229,7 @@ _DEFAULT_CAPABILITIES: Dict[str, BackendBucketingCapabilities] = {
         collective_device="cuda",
         collective_backends=("nccl", "rccl", "flagcx"),
         graph_capture_apis=(("cuda", "CUDAGraph", "graph"),),
+        extra_config_constexpr_keys=("waves_per_eu", "matrix_instr_nonkdim", "kpack"),
     ),
     "iluvatar": BackendBucketingCapabilities(
         backend="iluvatar",
@@ -420,6 +454,20 @@ def resolve_collective_device(
         return "cpu"
 
     effective = caps or get_backend_capabilities()
+    ext_modules = []
+    if effective.torch_extension_module:
+        ext_modules.append(effective.torch_extension_module)
+    if pg:
+        with _REGISTRY_LOCK:
+            for reg_caps in _DEFAULT_CAPABILITIES.values():
+                if reg_caps.torch_extension_module and pg in reg_caps.collective_backends:
+                    if reg_caps.torch_extension_module not in ext_modules:
+                        ext_modules.append(reg_caps.torch_extension_module)
+    for ext_mod in ext_modules:
+        try:
+            importlib.import_module(ext_mod)
+        except Exception:
+            pass
     preferred = effective.collective_device
     if preferred and preferred != "cpu":
         dev_mod = getattr(torch, preferred, None)
@@ -461,11 +509,23 @@ def resolve_collective_device(
     return "cpu"
 
 
+def get_min_dot_size(
+    backend: Optional[str] = None,
+    *,
+    dtype: Optional[Any] = None,
+    caps: Optional[BackendBucketingCapabilities] = None,
+) -> Tuple[int, int, int]:
+    """Resolve hardware ``(min_m, min_n, min_k)`` dot floor with FP8 awareness."""
+    effective = caps if caps is not None else get_backend_capabilities(backend)
+    return effective.min_dot_size_for_dtype(dtype)
+
+
 __all__ = [
     "BackendBucketingCapabilities",
     "canonicalize_backend_name",
     "detect_active_backend_name",
     "get_backend_capabilities",
+    "get_min_dot_size",
     "register_backend_capabilities",
     "resolve_candidate_generator",
     "resolve_collective_device",

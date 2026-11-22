@@ -39,11 +39,6 @@ from .adjust_kernel_param import auto_adjust_block_sizes
 from triton._C.libtriton import get_cache_invalidating_env_vars
 
 
-def _resolve_xpu_block_size_candidates():
-    from .backend_caps import resolve_candidate_generator
-    return resolve_candidate_generator()
-
-
 def _default_num_stages() -> int:
     from .backend_caps import get_backend_capabilities
     return get_backend_capabilities().default_num_stages
@@ -53,7 +48,7 @@ _EVENT_TIMER_ZERO_DIV: bool = False
 
 
 def _wallclock_bench_fallback(kernel_call) -> List[float]:
-    """Synchronized wall-clock fallback when device events return 0.0ms (e.g. XPU without KL3 event timers)."""
+    """Synchronized wall-clock fallback when device events return 0.0ms."""
     di = driver.active.get_device_interface()
     kernel_call()
     di.synchronize()
@@ -72,8 +67,7 @@ class Autotuner(KernelInterface):
 
     def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, pre_hook=None, post_hook=None,
                  prune_configs_by: Optional[Dict] = None, warmup=None, rep=None, use_cuda_graph=False, do_bench=None,
-                 cache_results=False, shape_policy=None, generate_configs=None, op_affiliation="", row_sign="",
-                 col_sign="", n_elem_sign=""):
+                 cache_results=False, shape_policy=None, **backend_kwargs):
         """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
             'perf_model': performance model used to predicate running time with different configs, returns running time
@@ -83,17 +77,13 @@ class Autotuner(KernelInterface):
                 `**kwargs: Dict[str, Any]) -> List[triton.Config]:`
                 and return pruned configs. It should return at least one config.
         """
-        default_stages = 2 if generate_configs is not None else 3
+        default_stages = _default_num_stages() if not configs else 3
         if not configs:
             self.configs = [Config({}, num_warps=4, num_stages=default_stages, num_ctas=1)]
         else:
             self.configs = configs
         self.no_configs = (not configs)
-        self.generate_configs = generate_configs
-        self.op_affiliation = op_affiliation
-        self.row_sign = row_sign
-        self.col_sign = col_sign
-        self.n_elem_sign = n_elem_sign
+        self._backend_candidate_kwargs = dict(backend_kwargs)
         if self.configs and (len(self.configs) > 0):
             self.shared_config_pre_hook = self.configs[0].pre_hook  # flagtree aabs
         self.keys = key
@@ -169,13 +159,15 @@ class Autotuner(KernelInterface):
                            "https://github.com/triton-lang/triton/pull/4496 for details."), DeprecationWarning,
                           stacklevel=1)
             if use_cuda_graph:
-                from ..testing import do_bench_cudagraph
-                self._do_bench = lambda kernel_call, quantiles: do_bench_cudagraph(
-                    kernel_call,
-                    rep=rep if rep is not None else 100,
-                    quantiles=quantiles,
-                )
-                return
+                from .backend_caps import get_backend_capabilities
+                if get_backend_capabilities().supports_cudagraph_bench:
+                    from ..testing import do_bench_cudagraph
+                    self._do_bench = lambda kernel_call, quantiles: do_bench_cudagraph(
+                        kernel_call,
+                        rep=rep if rep is not None else 100,
+                        quantiles=quantiles,
+                    )
+                    return
 
             import triton.testing
             self._do_bench = lambda kernel_call, quantiles: triton.testing.do_bench(
@@ -398,7 +390,7 @@ class Autotuner(KernelInterface):
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
         bucketing_enabled = (self.shape_policy is not None) or bool(knobs.autotuning.shape_bucketing)
-        has_dynamic_cand_gen = self.no_configs and self.generate_configs is not None
+        has_dynamic_cand_gen = self.no_configs and bool(self._backend_candidate_kwargs)
         if len(self.configs) > 1 or has_dynamic_cand_gen:
             all_args = {**self.nargs, **kwargs}
             _args = {k: v for (k, v) in all_args.items() if k in self.arg_names}
@@ -428,21 +420,15 @@ class Autotuner(KernelInterface):
                 key = raw_key
 
             if has_dynamic_cand_gen and not (bucketing_enabled and key in self.cache):
-                cand_fn = _resolve_xpu_block_size_candidates()
+                from .backend_caps import resolve_candidate_generator
+                cand_fn = resolve_candidate_generator()
                 if cand_fn is not None:
                     cand_nargs = (
                         {**self.nargs, **lookup.representative_dims}
                         if (bucketing_enabled and lookup is not None)
                         else self.nargs
                     )
-                    cands = cand_fn(
-                        cand_nargs,
-                        self.generate_configs,
-                        self.op_affiliation,
-                        self.row_sign,
-                        self.col_sign,
-                        self.n_elem_sign,
-                    )
+                    cands = cand_fn(cand_nargs, **self._backend_candidate_kwargs)
                     import os as _os
                     _max_cands = _os.environ.get("FLAGTREE_MAX_AUTOTUNE_CANDIDATES")
                     if _max_cands is not None and cands and int(_max_cands) > 0 and len(cands) > int(_max_cands):
@@ -452,7 +438,9 @@ class Autotuner(KernelInterface):
                         else:
                             _idxs = [round(i * (len(cands) - 1) / (_k - 1)) for i in range(_k)]
                             cands = [cands[idx] for idx in dict.fromkeys(_idxs)]
-                    self.configs = cands if cands else [Config({}, num_warps=4, num_stages=2, num_ctas=1)]
+                    self.configs = (
+                        cands if cands else [Config({}, num_warps=4, num_stages=_default_num_stages(), num_ctas=1)]
+                    )
 
             guard_mismatch = False
             if bucketing_enabled and key in self.cache and self.early_config_prune is not None:
@@ -700,7 +688,7 @@ class Config:
 
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
              warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False, shape_policy=None,
-             generate_configs=None, op_affiliation="sdnn", row_sign=None, col_sign=None, n_elem_sign=None):
+             **backend_kwargs):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -766,9 +754,7 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
         return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                          post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
                          use_cuda_graph=use_cuda_graph, do_bench=do_bench, cache_results=cache_results,
-                         shape_policy=shape_policy, generate_configs=generate_configs,
-                         op_affiliation=op_affiliation or "", row_sign=row_sign or "",
-                         col_sign=col_sign or "", n_elem_sign=n_elem_sign or "")
+                         shape_policy=shape_policy, **backend_kwargs)
 
     return decorator
 

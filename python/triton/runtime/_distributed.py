@@ -412,10 +412,6 @@ class DistributedDispatchGuard:
             import torch.distributed as dist
 
             if dist.is_available() and dist.is_initialized():
-                try:
-                    import torch_npu  # noqa: F401
-                except Exception:
-                    pass
                 pg_backend = ""
                 try:
                     pg_backend = str(dist.get_backend(self.process_group)).lower()

@@ -393,15 +393,16 @@ _CONFIG_CONSTEXPR_EXACT = frozenset({
     "waves_per_eu",
     "matrix_instr_nonkdim",
     "kpack",
-    "aiu_load_mask",
     "B_TRANSPOSED",
 })
 
 
-def _is_config_constexpr_key(name: str) -> bool:
-    if name in _CONFIG_CONSTEXPR_EXACT:
+def _is_config_constexpr_key(name: str, backend: Optional[str] = None) -> bool:
+    if name in _CONFIG_CONSTEXPR_EXACT or name.startswith(_CONFIG_CONSTEXPR_PREFIXES):
         return True
-    return name.startswith(_CONFIG_CONSTEXPR_PREFIXES)
+    from .backend_caps import get_backend_capabilities
+    extra = get_backend_capabilities(backend).extra_config_constexpr_keys
+    return name in extra
 
 
 class OnlineBucketPolicy:
@@ -681,7 +682,7 @@ class OnlineBucketPolicy:
         """Record observed integer argument values to distinguish dynamic bucketed
         axes from static dimensions without hardcoding parameter names."""
         for name, val in all_args.items():
-            if type(val) is not int or val <= 1 or _is_config_constexpr_key(name):
+            if type(val) is not int or val <= 1 or _is_config_constexpr_key(name, self.backend):
                 continue
             first_ax = self._axis_first_val.get(name)
             if first_ax is None:
@@ -728,7 +729,7 @@ class OnlineBucketPolicy:
     def is_axis_dynamic(self, axis_name: str, value: Any) -> bool:
         """Return True iff ``axis_name`` is explicitly marked dynamic or has observed
         multiple raw values inside the same bucket containing ``value``."""
-        if type(value) is not int or value <= 1 or _is_config_constexpr_key(axis_name):
+        if type(value) is not int or value <= 1 or _is_config_constexpr_key(axis_name, self.backend):
             return False
         if axis_name in self._explicit_dynamic_axes or axis_name in self._observed_dynamic_axes:
             return True
@@ -1459,7 +1460,7 @@ class IntervalPolicy:
         self.fallback_policy.premark_dynamic_buckets(*args, **kwargs)
 
     def is_axis_dynamic(self, axis_name: str, value: Any) -> bool:
-        if type(value) is not int or value <= 1 or _is_config_constexpr_key(axis_name):
+        if type(value) is not int or value <= 1 or _is_config_constexpr_key(axis_name, self.backend):
             return False
         spec = self.fallback_policy.axis_specs.get(axis_name)
         role_val = getattr(getattr(spec, "role", None), "value", getattr(spec, "role", None))

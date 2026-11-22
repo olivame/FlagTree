@@ -456,3 +456,43 @@ def test_interval_policy_per_op_fallback_isolation(tmp_path):
     pol_bmm.observe_args({"M": 116, "N": 116, "head_dim": 64})
     assert not pol_mm.is_axis_dynamic("N", 768)
     assert pol_mm.normalize_entry_scalar("N", 768, is_autotuned_key=True) == (int, 768)
+def test_backend_caps_cudagraph_bench_extra_keys_and_fp8_min_dot_size():
+    from triton.runtime.adjust_kernel_param import get_backend_min_dot_size
+    from triton.runtime.backend_caps import (
+        BackendBucketingCapabilities,
+        get_backend_capabilities,
+        get_min_dot_size,
+        register_backend_capabilities,
+    )
+    from triton.runtime.shape_bucketing import _is_config_constexpr_key
+
+    ppu = get_backend_capabilities("ppu")
+    thead = get_backend_capabilities("thead")
+    nv = get_backend_capabilities("nvidia")
+    mt = get_backend_capabilities("mthreads")
+    ascend = get_backend_capabilities("ascend")
+
+    assert ppu.supports_cudagraph_bench is False
+    assert thead.supports_cudagraph_bench is False
+    assert nv.supports_cudagraph_bench is True
+    assert ascend.torch_extension_module == "torch_npu"
+
+    assert _is_config_constexpr_key("aiu_load_mask", backend="ppu") is True
+    assert _is_config_constexpr_key("aiu_load_mask", backend="nvidia") is False
+
+    register_backend_capabilities(
+        "mock_fp8_chip",
+        BackendBucketingCapabilities(
+            backend="mock_fp8_chip",
+            min_dot_size=(16, 16, 16),
+            fp8_min_dot_size=(16, 16, 32),
+            extra_config_constexpr_keys=("custom_hw_mask",),
+            supports_cudagraph_bench=False,
+        ),
+    )
+    assert _is_config_constexpr_key("custom_hw_mask", backend="mock_fp8_chip") is True
+    assert get_min_dot_size("nvidia", dtype="float8_e4m3fn")[2] >= 32
+    assert get_min_dot_size("ppu", dtype="float8_e5m2") == (16, 16, 32)
+    assert get_min_dot_size("mthreads", dtype="fp8e4nv") == (64, 16, 32)
+    assert get_min_dot_size("nvidia", dtype="bfloat16") == (16, 16, 16)
+    assert get_backend_min_dot_size("ppu", dtype="float8_e4m3fn") == (16, 16, 32)
