@@ -39,24 +39,50 @@ import os
 from triton.flagtune._version import __version__
 from triton.flagtune.core.interfaces import BenchmarkFn, ConfigProposer
 from triton.flagtune.runtime.autotuner import Flagtuner, flagtune
+from triton.flagtune.runtime.comm_profiler import (
+    CollectiveProfile,
+    CommProfileResult,
+    CommSample,
+    profile_comm_topology,
+)
 from triton.flagtune.runtime.partition_planner import (
     BucketedOperatorCostModel,
     CollectiveCostModel,
-    HardwareClusterSpec,
-    InferenceConstraints,
-    ModelArchitectureSpec,
-    ParallelStrategyKind,
-    PartitionDecisionReport,
-    PartitionPlanCandidate,
     DeviceMeshSpec,
     ExecutableParallelPlan,
     GraphWorkloadSpec,
+    HardwareClusterSpec,
+    HardwareTopologySpec,
+    InferenceConstraints,
+    ModelArchitectureSpec,
     OperatorStageSpec,
+    ParallelStrategyKind,
+    PartitionDecisionReport,
+    PartitionPlanCandidate,
     PartitionPlanner,
-    build_executable_plan,
     TrainingConstraints,
     WorkloadKind,
+    build_executable_plan,
 )
+
+try:
+    from triton.flagtune.runtime.parallel_executor import (
+        ColumnParallelLinear,
+        ParallelPlanExecutor,
+        ParallelTransformerBlock,
+        ParallelTransformerModel,
+        RowParallelLinear,
+        TransformerStackConfig,
+        run_parallel_plan_benchmark,
+    )
+except Exception:  # pragma: no cover - optional torch runtime
+    ColumnParallelLinear = None  # type: ignore[assignment]
+    ParallelPlanExecutor = None  # type: ignore[assignment]
+    ParallelTransformerBlock = None  # type: ignore[assignment]
+    ParallelTransformerModel = None  # type: ignore[assignment]
+    RowParallelLinear = None  # type: ignore[assignment]
+    TransformerStackConfig = None  # type: ignore[assignment]
+    run_parallel_plan_benchmark = None  # type: ignore[assignment]
 
 _ENABLED = None
 

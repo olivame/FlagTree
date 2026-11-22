@@ -54,6 +54,7 @@ class ParallelStrategyKind(str, Enum):
     EXPERT_PARALLEL = "ep"
     PIPELINE_PARALLEL = "pp"
     HYBRID_DP_TP = "dp_tp"
+    HYBRID_DP_PP = "dp_pp"
     HYBRID_3D = "dp_tp_pp"
     TABLE_PARALLEL_DP = "table_dp"
 
@@ -241,6 +242,29 @@ class CollectiveCostModel:
             )
         return cls(curves=curves)
 
+    @classmethod
+    def from_comm_profile(cls, comm_profile: Any) -> "CollectiveCostModel":
+        """Build a calibrated ``CollectiveCostModel`` from a comm profile object, dict, or JSON path."""
+        profile_obj = _coerce_comm_profile(comm_profile)
+        return profile_obj.to_collective_cost_model()
+
+
+def _coerce_comm_profile(comm_profile: Any) -> Any:
+    """Normalize a ``CommProfileResult``, mapping, or JSON path to ``CommProfileResult``."""
+    from triton.flagtune.runtime.comm_profiler import CommProfileResult
+
+    if isinstance(comm_profile, CommProfileResult):
+        return comm_profile
+    if isinstance(comm_profile, (str, Path)):
+        return CommProfileResult.load_json(comm_profile)
+    if isinstance(comm_profile, Mapping):
+        return CommProfileResult.from_dict(comm_profile)
+    if hasattr(comm_profile, "to_collective_cost_model") and hasattr(comm_profile, "to_dict"):
+        return comm_profile
+    raise TypeError(
+        f"Expected CommProfileResult, dict, or path to comm_profile.json; got {type(comm_profile).__name__}"
+    )
+
 
 @dataclass(frozen=True)
 class OperatorBucketMeasurement:
@@ -360,6 +384,11 @@ class HardwareClusterSpec:
     devices_per_node: Optional[int] = None
     inter_node_bandwidth_gbps: float = 25.0
     inter_node_latency_us: float = 45.0
+    intra_node_bandwidth_gbps: Optional[float] = None
+    intra_node_latency_us: Optional[float] = None
+    comm_backend: Optional[str] = None
+    host_staged_collectives: bool = False
+    device_name: Optional[str] = None
 
     @property
     def num_nodes(self) -> int:
@@ -370,6 +399,46 @@ class HardwareClusterSpec:
     @property
     def usable_memory_bytes(self) -> int:
         return int(self.device_memory_bytes * self.memory_safety_margin)
+
+    @classmethod
+    def from_comm_profile(
+        cls,
+        comm_profile: Any,
+        *,
+        device_memory_bytes: Optional[int] = None,
+        memory_safety_margin: float = 0.90,
+        supports_tle: bool = False,
+        backend: Optional[str] = None,
+        devices_per_node: Optional[int] = None,
+        inter_node_bandwidth_gbps: float = 25.0,
+        inter_node_latency_us: float = 45.0,
+    ) -> "HardwareClusterSpec":
+        """Build a calibrated hardware topology spec from a measured communication profile."""
+        prof = _coerce_comm_profile(comm_profile)
+        resolved_mem = int(
+            device_memory_bytes if device_memory_bytes is not None else prof.device_memory_bytes
+        )
+        resolved_backend = str(backend if backend is not None else prof.device_type)
+        return cls(
+            num_devices=int(prof.world_size),
+            device_memory_bytes=resolved_mem,
+            memory_safety_margin=float(memory_safety_margin),
+            supports_tle=bool(supports_tle),
+            backend=resolved_backend,
+            devices_per_node=(
+                int(devices_per_node) if devices_per_node is not None else int(prof.world_size)
+            ),
+            inter_node_bandwidth_gbps=float(inter_node_bandwidth_gbps),
+            inter_node_latency_us=float(inter_node_latency_us),
+            intra_node_bandwidth_gbps=float(prof.intra_node_bandwidth_gbps),
+            intra_node_latency_us=float(prof.base_latency_us),
+            comm_backend=str(prof.backend),
+            host_staged_collectives=bool(prof.host_staged),
+            device_name=str(prof.device_name),
+        )
+
+
+HardwareTopologySpec = HardwareClusterSpec
 
 
 @dataclass(frozen=True)
@@ -497,6 +566,7 @@ class PartitionDecisionReport:
     recommended: Optional[PartitionPlanCandidate]
     ranked_candidates: List[PartitionPlanCandidate]
     rejected_candidates: List[PartitionPlanCandidate]
+    explanation: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         def _ser(c: Optional[PartitionPlanCandidate]) -> Optional[Dict[str, Any]]:
@@ -516,6 +586,7 @@ class PartitionDecisionReport:
             "recommended": _ser(self.recommended),
             "ranked_candidates": [_ser(c) for c in self.ranked_candidates],
             "rejected_candidates": [_ser(c) for c in self.rejected_candidates],
+            "explanation": dict(self.explanation),
         }
 
     def save_json(self, path: str | Path) -> None:
@@ -539,7 +610,201 @@ class PartitionPlanner:
     ) -> None:
         self.cluster = cluster
         self.compute_model = compute_model or BucketedOperatorCostModel()
-        self.collective_model = collective_model or CollectiveCostModel()
+        if collective_model is not None:
+            self.collective_model = collective_model
+        elif cluster.intra_node_bandwidth_gbps is not None:
+            self.collective_model = CollectiveCostModel(
+                intra_node_bandwidth_gbps=cluster.intra_node_bandwidth_gbps,
+                base_latency_us=(
+                    cluster.intra_node_latency_us if cluster.intra_node_latency_us is not None else 8.0
+                ),
+            )
+        else:
+            self.collective_model = CollectiveCostModel()
+
+    @classmethod
+    def from_comm_profile(
+        cls,
+        comm_profile: Any,
+        *,
+        compute_model: Optional[BucketedOperatorCostModel] = None,
+        device_memory_bytes: Optional[int] = None,
+        memory_safety_margin: float = 0.90,
+        supports_tle: bool = False,
+        backend: Optional[str] = None,
+        devices_per_node: Optional[int] = None,
+        inter_node_bandwidth_gbps: float = 25.0,
+        inter_node_latency_us: float = 45.0,
+    ) -> "PartitionPlanner":
+        """Construct a ``PartitionPlanner`` calibrated from a real communication profile."""
+        prof = _coerce_comm_profile(comm_profile)
+        cluster = HardwareClusterSpec.from_comm_profile(
+            prof,
+            device_memory_bytes=device_memory_bytes,
+            memory_safety_margin=memory_safety_margin,
+            supports_tle=supports_tle,
+            backend=backend,
+            devices_per_node=devices_per_node,
+            inter_node_bandwidth_gbps=inter_node_bandwidth_gbps,
+            inter_node_latency_us=inter_node_latency_us,
+        )
+        collective_model = prof.to_collective_cost_model()
+        return cls(cluster=cluster, compute_model=compute_model, collective_model=collective_model)
+
+    def _build_explanation(
+        self,
+        model_name: str,
+        workload_kind: WorkloadKind,
+        feasible: Sequence[PartitionPlanCandidate],
+        rejected: Sequence[PartitionPlanCandidate],
+    ) -> Dict[str, Any]:
+        """Build a structured, human-readable justification comparing selected plan vs baselines."""
+        calibrated = (
+            self.cluster.intra_node_bandwidth_gbps is not None
+            or self.cluster.comm_backend is not None
+        )
+        cal_summary = {
+            "calibrated": calibrated,
+            "comm_backend": self.cluster.comm_backend or "uncalibrated_default",
+            "host_staged_collectives": bool(self.cluster.host_staged_collectives),
+            "intra_node_bandwidth_gbps": self.cluster.intra_node_bandwidth_gbps,
+            "intra_node_latency_us": self.cluster.intra_node_latency_us,
+            "device_name": self.cluster.device_name or self.cluster.backend,
+        }
+        if not feasible:
+            reasons = [
+                {
+                    "plan_id": c.plan_id,
+                    "strategy": c.strategy.value,
+                    "fits_memory": c.fits_memory,
+                    "meets_sla": c.meets_sla,
+                    "per_device_memory_mb": round(c.per_device_memory_bytes / (1024.0 * 1024.0), 2),
+                    "notes": list(c.notes),
+                }
+                for c in rejected[:6]
+            ]
+            return {
+                "selected_plan_id": None,
+                "summary": (
+                    f"No feasible parallel plan found for {model_name} ({workload_kind.value}) "
+                    f"across {self.cluster.num_devices} devices; {len(rejected)} candidate(s) rejected."
+                ),
+                "dominant_cost_factors": {},
+                "baseline_comparisons": reasons,
+                "calibration_summary": cal_summary,
+            }
+
+        rec = feasible[0]
+        sync_bubble_ms = max(0.0, rec.step_latency_ms - rec.compute_time_ms - rec.exposed_comm_time_ms)
+        comm_share_pct = (
+            100.0 * rec.exposed_comm_time_ms / max(1e-6, rec.step_latency_ms)
+        )
+        dominant = {
+            "compute_ms": round(rec.compute_time_ms, 3),
+            "comm_ms": round(rec.comm_time_ms, 3),
+            "exposed_comm_ms": round(rec.exposed_comm_time_ms, 3),
+            "sync_bubble_ms": round(sync_bubble_ms, 3),
+            "comm_share_pct": round(comm_share_pct, 2),
+            "pipeline_bubble_ratio": round(rec.pipeline_bubble_ratio, 4),
+            "per_device_memory_mb": round(rec.per_device_memory_bytes / (1024.0 * 1024.0), 2),
+        }
+
+        # Pick best candidate per alternative strategy (feasible first, else rejected)
+        seen_strategies = {rec.strategy}
+        baselines: List[Dict[str, Any]] = []
+        for pool, is_feas in ((feasible[1:], True), (rejected, False)):
+            for cand in pool:
+                if cand.strategy in seen_strategies:
+                    continue
+                seen_strategies.add(cand.strategy)
+                if is_feas:
+                    speedup = rec.throughput_tokens_per_sec / max(1e-6, cand.throughput_tokens_per_sec)
+                    comm_delta = cand.exposed_comm_time_ms - rec.exposed_comm_time_ms
+                    mem_delta_mb = (
+                        cand.per_device_memory_bytes - rec.per_device_memory_bytes
+                    ) / (1024.0 * 1024.0)
+                    if comm_delta > 0.5:
+                        reason = (
+                            f"lower exposed comm by {comm_delta:.2f} ms "
+                            f"({rec.exposed_comm_time_ms:.2f} vs {cand.exposed_comm_time_ms:.2f} ms)"
+                        )
+                    elif rec.step_latency_ms < cand.step_latency_ms:
+                        reason = (
+                            f"lower step latency ({rec.step_latency_ms:.2f} vs "
+                            f"{cand.step_latency_ms:.2f} ms)"
+                        )
+                    else:
+                        reason = (
+                            f"higher cluster throughput ({rec.throughput_tokens_per_sec:.1f} vs "
+                            f"{cand.throughput_tokens_per_sec:.1f} tok/s)"
+                        )
+                    baselines.append(
+                        {
+                            "baseline_plan_id": cand.plan_id,
+                            "baseline_strategy": cand.strategy.value,
+                            "feasible": True,
+                            "predicted_speedup_vs_baseline": round(speedup, 4),
+                            "baseline_throughput_tps": round(cand.throughput_tokens_per_sec, 2),
+                            "baseline_step_latency_ms": round(cand.step_latency_ms, 3),
+                            "baseline_exposed_comm_ms": round(cand.exposed_comm_time_ms, 3),
+                            "comm_reduction_ms": round(comm_delta, 3),
+                            "memory_savings_mb": round(mem_delta_mb, 2),
+                            "reason": reason,
+                        }
+                    )
+                else:
+                    rej_reason = ", ".join(cand.notes) if cand.notes else "infeasible"
+                    baselines.append(
+                        {
+                            "baseline_plan_id": cand.plan_id,
+                            "baseline_strategy": cand.strategy.value,
+                            "feasible": False,
+                            "predicted_speedup_vs_baseline": None,
+                            "baseline_throughput_tps": round(cand.throughput_tokens_per_sec, 2),
+                            "baseline_step_latency_ms": round(cand.step_latency_ms, 3),
+                            "baseline_exposed_comm_ms": round(cand.exposed_comm_time_ms, 3),
+                            "comm_reduction_ms": round(
+                                cand.exposed_comm_time_ms - rec.exposed_comm_time_ms, 3
+                            ),
+                            "memory_savings_mb": round(
+                                (cand.per_device_memory_bytes - rec.per_device_memory_bytes)
+                                / (1024.0 * 1024.0),
+                                2,
+                            ),
+                            "reason": f"rejected ({rej_reason})",
+                        }
+                    )
+
+        comp_snippets = []
+        for b_item in baselines[:3]:
+            if b_item["feasible"]:
+                comp_snippets.append(
+                    f"{b_item['predicted_speedup_vs_baseline']:.2f}x vs {b_item['baseline_plan_id']}"
+                )
+            else:
+                comp_snippets.append(
+                    f"{b_item['baseline_plan_id']} {b_item['reason']}"
+                )
+        cmp_text = ("; ".join(comp_snippets)) if comp_snippets else "single feasible candidate"
+        cal_tag = (
+            f"comm-calibrated ({cal_summary['comm_backend']}, "
+            f"bw={self.cluster.intra_node_bandwidth_gbps:.2f} GB/s)"
+            if calibrated and self.cluster.intra_node_bandwidth_gbps is not None
+            else "uncalibrated default"
+        )
+        summary = (
+            f"Selected {rec.plan_id} for {model_name} ({workload_kind.value}, {cal_tag}): "
+            f"step={rec.step_latency_ms:.2f} ms (compute={rec.compute_time_ms:.2f} ms, "
+            f"exposed_comm={rec.exposed_comm_time_ms:.2f} ms, bubble={rec.pipeline_bubble_ratio:.2%}), "
+            f"mem={dominant['per_device_memory_mb']:.1f} MB/dev; {cmp_text}."
+        )
+        return {
+            "selected_plan_id": rec.plan_id,
+            "summary": summary,
+            "dominant_cost_factors": dominant,
+            "baseline_comparisons": baselines,
+            "calibration_summary": cal_summary,
+        }
 
     def _layer_roofline_comp_ms(
         self,
@@ -683,6 +948,8 @@ class PartitionPlanner:
                         topologies.append((ParallelStrategyKind.HYBRID_DP_TP, ndev // d, d, 1, 1))
                 if d > 1 and model.num_layers % d == 0:
                     topologies.append((ParallelStrategyKind.PIPELINE_PARALLEL, 1, 1, d, 1))
+                    if ndev // d > 1:
+                        topologies.append((ParallelStrategyKind.HYBRID_DP_PP, ndev // d, 1, d, 1))
                 if d > 1 and model.num_experts > 1 and model.num_experts % d == 0:
                     topologies.append((ParallelStrategyKind.EXPERT_PARALLEL, 1, 1, 1, d))
 
@@ -716,52 +983,78 @@ class PartitionPlanner:
                 fits_mem = mem_total <= usable_mem
 
                 layers_per_stage = model.num_layers // pp
-                pre_layer_ms, pre_comp_ms, pre_exp_comm_ms = self._layer_forward_ms(
-                    model, act_tokens, s_pre, tp, ep, use_tle, constraints.moe_dispatch_skew
-                )
-                pp_p2p_ms = (
-                    (pp - 1)
-                    * self.collective_model.estimate_ms(
-                        CollectiveKind.P2P, act_tokens * model.hidden_size * model.dtype_bytes, 2
-                    )
-                    if pp > 1
-                    else 0.0
-                )
                 num_micro = max(1, min(b, pp * 2)) if pp > 1 else 1
                 bubble_ratio = (pp - 1.0) / float(num_micro + pp - 1) if pp > 1 else 0.0
 
-                ttft_ms = model.num_layers * pre_layer_ms + pp_p2p_ms
-                if strat is ParallelStrategyKind.SINGLE_DEVICE and not use_tle:
-                    single_tp1_ttft = ttft_ms
-
-                if is_decode_workload:
-                    dec_layer_ms, dec_comp_ms, dec_exp_comm_ms = self._layer_forward_ms(
-                        model, b, kv_ctx, tp, ep, use_tle, constraints.moe_dispatch_skew, is_decode_step=True
+                if pp > 1 and not is_decode_workload:
+                    micro_tokens = max(1, math.ceil(act_tokens / float(num_micro)))
+                    m_layer_ms, m_comp_ms, m_exp_comm_ms = self._layer_forward_ms(
+                        model, micro_tokens, s_pre, tp, ep, use_tle, constraints.moe_dispatch_skew
                     )
-                    dec_p2p_ms = (
+                    hop_p2p_ms = self.collective_model.estimate_ms(
+                        CollectiveKind.P2P, micro_tokens * model.hidden_size * model.dtype_bytes, 2
+                    )
+                    stage_ms = layers_per_stage * m_layer_ms
+                    ttft_ms = pp * stage_ms + (pp - 1) * hop_p2p_ms
+                    tpot_ms = 0.0
+                    req_batch_ms = (num_micro + pp - 1) * (stage_ms + hop_p2p_ms)
+                    tokens_per_batch = act_tokens
+                    comp_stage_ms = num_micro * layers_per_stage * m_comp_ms
+                    exp_comm_total = (
+                        num_micro * layers_per_stage * m_exp_comm_ms + (num_micro + pp - 1) * hop_p2p_ms
+                    )
+                    qps = float(dp * b) / max(1e-6, req_batch_ms * 1e-3)
+                    tps = float(dp * tokens_per_batch) / max(1e-6, req_batch_ms * 1e-3)
+                else:
+                    pre_layer_ms, pre_comp_ms, pre_exp_comm_ms = self._layer_forward_ms(
+                        model, act_tokens, s_pre, tp, ep, use_tle, constraints.moe_dispatch_skew
+                    )
+                    pp_p2p_ms = (
                         (pp - 1)
                         * self.collective_model.estimate_ms(
-                            CollectiveKind.P2P, b * model.hidden_size * model.dtype_bytes, 2
+                            CollectiveKind.P2P, act_tokens * model.hidden_size * model.dtype_bytes, 2
                         )
                         if pp > 1
                         else 0.0
                     )
-                    tpot_ms = model.num_layers * dec_layer_ms + dec_p2p_ms
-                    out_len = max(1, constraints.output_tokens)
-                    req_batch_ms = ttft_ms + out_len * tpot_ms
-                    tokens_per_batch = b * (s_pre + out_len)
-                    comp_total = model.num_layers * (pre_comp_ms + out_len * dec_comp_ms)
-                    exp_comm_total = (
-                        model.num_layers * (pre_exp_comm_ms + out_len * dec_exp_comm_ms)
-                        + pp_p2p_ms
-                        + out_len * dec_p2p_ms
-                    )
-                else:
-                    tpot_ms = 0.0
-                    req_batch_ms = ttft_ms / (1.0 - bubble_ratio * 0.5)
-                    tokens_per_batch = act_tokens
-                    comp_total = model.num_layers * pre_comp_ms
-                    exp_comm_total = model.num_layers * pre_exp_comm_ms + pp_p2p_ms
+                    ttft_ms = model.num_layers * pre_layer_ms + pp_p2p_ms
+                    if strat is ParallelStrategyKind.SINGLE_DEVICE and not use_tle:
+                        single_tp1_ttft = ttft_ms
+
+                    if is_decode_workload:
+                        dec_layer_ms, dec_comp_ms, dec_exp_comm_ms = self._layer_forward_ms(
+                            model, b, kv_ctx, tp, ep, use_tle, constraints.moe_dispatch_skew, is_decode_step=True
+                        )
+                        dec_p2p_ms = (
+                            (pp - 1)
+                            * self.collective_model.estimate_ms(
+                                CollectiveKind.P2P, b * model.hidden_size * model.dtype_bytes, 2
+                            )
+                            if pp > 1
+                            else 0.0
+                        )
+                        tpot_ms = model.num_layers * dec_layer_ms + dec_p2p_ms
+                        out_len = max(1, constraints.output_tokens)
+                        req_batch_ms = ttft_ms + out_len * tpot_ms
+                        tokens_per_batch = b * (s_pre + out_len)
+                        comp_total = model.num_layers * (pre_comp_ms + out_len * dec_comp_ms)
+                        exp_comm_total = (
+                            model.num_layers * (pre_exp_comm_ms + out_len * dec_exp_comm_ms)
+                            + pp_p2p_ms
+                            + out_len * dec_p2p_ms
+                        )
+                    else:
+                        tpot_ms = 0.0
+                        req_batch_ms = ttft_ms
+                        tokens_per_batch = act_tokens
+                        comp_total = model.num_layers * pre_comp_ms
+                        exp_comm_total = model.num_layers * pre_exp_comm_ms + pp_p2p_ms
+
+                    comp_stage_ms = comp_total * (layers_per_stage / float(model.num_layers))
+                    # Replica-DP scales whole-node throughput linearly by dp with ZERO collective overhead!
+                    stage_penalty = 1.0 - bubble_ratio
+                    qps = float(dp * b) / max(1e-6, req_batch_ms * 1e-3) * stage_penalty
+                    tps = float(dp * tokens_per_batch) / max(1e-6, req_batch_ms * 1e-3) * stage_penalty
 
                 meets_ttft = constraints.ttft_sla_ms is None or ttft_ms <= constraints.ttft_sla_ms
                 meets_tpot = (
@@ -771,14 +1064,11 @@ class PartitionPlanner:
                 )
                 meets_sla = meets_ttft and meets_tpot
 
-                # Replica-DP scales whole-node throughput linearly by dp with ZERO collective overhead!
-                stage_penalty = 1.0 - bubble_ratio
-                qps = float(dp * b) / max(1e-6, req_batch_ms * 1e-3) * stage_penalty
-                tps = float(dp * tokens_per_batch) / max(1e-6, req_batch_ms * 1e-3) * stage_penalty
-
                 notes: List[str] = []
                 if strat is ParallelStrategyKind.REPLICA_DP:
                     notes.append("zero_cross_device_collective_overhead")
+                if pp > 1:
+                    notes.append(f"pipeline_microbatches={num_micro}")
                 if tp > 1 and single_tp1_ttft is not None and ttft_ms >= single_tp1_ttft * 0.85:
                     notes.append("tp_collective_overhead_diminishes_small_model_scaling")
                 if use_tle:
@@ -811,7 +1101,7 @@ class PartitionPlanner:
                         tpot_ms=tpot_ms,
                         throughput_tokens_per_sec=tps,
                         throughput_requests_per_sec=qps,
-                        compute_time_ms=comp_total * (layers_per_stage / float(model.num_layers)),
+                        compute_time_ms=comp_stage_ms,
                         comm_time_ms=exp_comm_total,
                         exposed_comm_time_ms=exp_comm_total,
                         pipeline_bubble_ratio=bubble_ratio,
@@ -823,6 +1113,7 @@ class PartitionPlanner:
         rejected = [c for c in candidates if not c.feasible]
         feasible.sort(key=lambda c: (c.throughput_tokens_per_sec, -c.step_latency_ms), reverse=True)
         rejected.sort(key=lambda c: (c.fits_memory, -c.per_device_memory_bytes), reverse=True)
+        explanation = self._build_explanation(model.name, WorkloadKind.INFERENCE, feasible, rejected)
         return PartitionDecisionReport(
             model_name=model.name,
             workload_kind=WorkloadKind.INFERENCE,
@@ -830,6 +1121,7 @@ class PartitionPlanner:
             recommended=feasible[0] if feasible else None,
             ranked_candidates=feasible,
             rejected_candidates=rejected,
+            explanation=explanation,
         )
 
     def plan_training(
@@ -860,6 +1152,9 @@ class PartitionPlanner:
                         topologies.append((ParallelStrategyKind.HYBRID_DP_TP, dp_rem, d, 1, 1))
                 if d > 1 and model.num_layers % d == 0 and gbs >= d:
                     topologies.append((ParallelStrategyKind.PIPELINE_PARALLEL, 1, 1, d, 1))
+                    dp_rem = ndev // d
+                    if dp_rem > 1 and gbs >= dp_rem * d:
+                        topologies.append((ParallelStrategyKind.HYBRID_DP_PP, dp_rem, 1, d, 1))
                 if d > 1 and model.num_experts > 1 and model.num_experts % d == 0:
                     dp_rem = max(1, ndev // d)
                     topologies.append((ParallelStrategyKind.EXPERT_PARALLEL, dp_rem, 1, 1, d))
@@ -941,38 +1236,66 @@ class PartitionPlanner:
 
                 # Communication modeling per strategy
                 raw_comm_ms = 0.0
-                exposed_comm_ms = 0.0
+                pipelined_exposed_comm_ms = 0.0
+                post_pipeline_exposed_comm_ms = 0.0
                 notes: List[str] = []
+                eff_ddp_overlap = (
+                    min(constraints.ddp_backward_overlap, 0.20)
+                    if self.cluster.host_staged_collectives
+                    else constraints.ddp_backward_overlap
+                )
+                eff_fsdp_overlap = (
+                    min(constraints.fsdp_prefetch_overlap, 0.15)
+                    if self.cluster.host_staged_collectives
+                    else constraints.fsdp_prefetch_overlap
+                )
 
                 if tp > 1:
-                    # TP + Sequence Parallel: 2 AllGather + 2 ReduceScatter per layer in fwd, and again in bwd
                     sp_bytes = micro_tokens * model.hidden_size * model.dtype_bytes
-                    ag_ms = self.collective_model.estimate_ms(CollectiveKind.ALL_GATHER, sp_bytes, tp)
-                    rs_ms = self.collective_model.estimate_ms(CollectiveKind.REDUCE_SCATTER, sp_bytes, tp)
-                    tp_comm_per_layer_step = 3.0 * (ag_ms + rs_ms)
+                    if self.cluster.host_staged_collectives and not use_tle:
+                        # Standard Megatron TP: 2 AllReduces in fwd + 2 AllReduces in bwd per layer
+                        ar_ms = self.collective_model.estimate_ms(
+                            CollectiveKind.ALL_REDUCE, sp_bytes, tp
+                        )
+                        tp_comm_per_layer_step = 4.0 * ar_ms
+                    else:
+                        # TP + Sequence Parallel: AllGather + ReduceScatter per layer in fwd and bwd
+                        ag_ms = self.collective_model.estimate_ms(
+                            CollectiveKind.ALL_GATHER, sp_bytes, tp
+                        )
+                        rs_ms = self.collective_model.estimate_ms(
+                            CollectiveKind.REDUCE_SCATTER, sp_bytes, tp
+                        )
+                        tp_comm_per_layer_step = 3.0 * (ag_ms + rs_ms)
                     raw_tp_comm = num_micro * layers_on_rank * tp_comm_per_layer_step
                     raw_comm_ms += raw_tp_comm
                     if use_tle:
-                        _, exp_tp = self.compute_model.fuse_tle_overlap_ms(total_comp_ms * 0.65, raw_tp_comm)
-                        exposed_comm_ms += exp_tp
+                        _, exp_tp = self.compute_model.fuse_tle_overlap_ms(
+                            total_comp_ms * 0.65, raw_tp_comm
+                        )
+                        pipelined_exposed_comm_ms += exp_tp
                         notes.append("tle_gemm_reducescatter_allgather_overlap")
                     else:
-                        exposed_comm_ms += raw_tp_comm
+                        pipelined_exposed_comm_ms += raw_tp_comm
 
                 if ep > 1 and model.num_experts > 1:
                     a2a_bytes = micro_tokens * model.top_k_experts * model.hidden_size * model.dtype_bytes
                     # 2 AllToAll in fwd + 2 AllToAll in bwd
                     ep_comm = num_micro * layers_on_rank * 4.0 * self.collective_model.estimate_ms(
-                        CollectiveKind.ALL_TO_ALL, a2a_bytes, ep, skew_factor=constraints.moe_dispatch_skew
+                        CollectiveKind.ALL_TO_ALL,
+                        a2a_bytes,
+                        ep,
+                        skew_factor=constraints.moe_dispatch_skew,
                     )
                     raw_comm_ms += ep_comm
-                    exposed_comm_ms += ep_comm
+                    pipelined_exposed_comm_ms += ep_comm
 
                 if (
                     strat
                     in (
                         ParallelStrategyKind.DDP,
                         ParallelStrategyKind.HYBRID_DP_TP,
+                        ParallelStrategyKind.HYBRID_DP_PP,
                         ParallelStrategyKind.HYBRID_3D,
                         ParallelStrategyKind.EXPERT_PARALLEL,
                     )
@@ -986,33 +1309,39 @@ class PartitionPlanner:
                     )
                     raw_comm_ms += ddp_ar_ms
                     bwd_window_ms = total_comp_ms * (bwd_mult / (1.0 + bwd_mult))
-                    overlapped = min(bwd_window_ms * constraints.ddp_backward_overlap, ddp_ar_ms * 0.85)
-                    exposed_comm_ms += max(0.0, ddp_ar_ms - overlapped)
+                    overlapped = min(bwd_window_ms * eff_ddp_overlap, ddp_ar_ms * 0.85)
+                    post_pipeline_exposed_comm_ms += max(0.0, ddp_ar_ms - overlapped)
                     notes.append(f"ddp_gradient_buckets={num_buckets}")
 
                 if strat is ParallelStrategyKind.ZERO_FSDP:
                     layer_bytes = (total_p // max(1, model.num_layers)) * model.dtype_bytes
                     # FSDP: AllGather fwd + AllGather bwd + ReduceScatter bwd per layer
                     ag_ms = self.collective_model.estimate_ms(CollectiveKind.ALL_GATHER, layer_bytes, ndev)
-                    rs_ms = self.collective_model.estimate_ms(CollectiveKind.REDUCE_SCATTER, layer_bytes, ndev)
+                    rs_ms = self.collective_model.estimate_ms(
+                        CollectiveKind.REDUCE_SCATTER, layer_bytes, ndev
+                    )
                     fsdp_raw = num_micro * model.num_layers * (2.0 * ag_ms + rs_ms)
                     raw_comm_ms += fsdp_raw
-                    overlapped = min(total_comp_ms * constraints.fsdp_prefetch_overlap, fsdp_raw * 0.80)
-                    exposed_comm_ms += max(0.0, fsdp_raw - overlapped)
+                    overlapped = min(total_comp_ms * eff_fsdp_overlap, fsdp_raw * 0.80)
+                    post_pipeline_exposed_comm_ms += max(0.0, fsdp_raw - overlapped)
                     notes.append("fsdp_sharded_params_grads_opt")
 
                 bubble_ratio = 0.0
                 if pp > 1:
                     bubble_ratio = (pp - 1.0) / float(num_micro + pp - 1)
                     p2p_bytes = micro_tokens * model.hidden_size * model.dtype_bytes
-                    pp_p2p = num_micro * 2.0 * (pp - 1) * self.collective_model.estimate_ms(
+                    # Per-stage fwd+bwd P2P; bubble scaling maps num_micro -> (num_micro + pp - 1) hops
+                    pp_p2p = num_micro * 2.0 * self.collective_model.estimate_ms(
                         CollectiveKind.P2P, p2p_bytes, 2
                     )
-                    raw_comm_ms += pp_p2p
-                    exposed_comm_ms += pp_p2p
+                    raw_comm_ms += pp_p2p * ((num_micro + pp - 1) / float(max(1, num_micro)))
+                    pipelined_exposed_comm_ms += pp_p2p
                     notes.append(f"1f1b_microbatches={num_micro}")
 
-                bubble_ms = (total_comp_ms + exposed_comm_ms) * (bubble_ratio / max(1e-4, 1.0 - bubble_ratio))
+                exposed_comm_ms = pipelined_exposed_comm_ms + post_pipeline_exposed_comm_ms
+                bubble_ms = (total_comp_ms + pipelined_exposed_comm_ms) * (
+                    bubble_ratio / max(1e-4, 1.0 - bubble_ratio)
+                )
                 step_ms = total_comp_ms + exposed_comm_ms + bubble_ms
                 global_tokens = gbs * seq_len
                 tps = float(global_tokens) / max(1e-6, step_ms * 1e-3)
@@ -1057,6 +1386,7 @@ class PartitionPlanner:
         rejected = [c for c in candidates if not c.feasible]
         feasible.sort(key=lambda c: c.throughput_tokens_per_sec, reverse=True)
         rejected.sort(key=lambda c: c.per_device_memory_bytes)
+        explanation = self._build_explanation(model.name, WorkloadKind.TRAINING, feasible, rejected)
         return PartitionDecisionReport(
             model_name=model.name,
             workload_kind=WorkloadKind.TRAINING,
@@ -1064,6 +1394,7 @@ class PartitionPlanner:
             recommended=feasible[0] if feasible else None,
             ranked_candidates=feasible,
             rejected_candidates=rejected,
+            explanation=explanation,
         )
 
 
@@ -1174,6 +1505,7 @@ class PartitionPlanner:
         rejected = [c for c in candidates if not c.feasible]
         feasible.sort(key=lambda c: (c.throughput_requests_per_sec, -c.step_latency_ms), reverse=True)
         rejected.sort(key=lambda c: c.per_device_memory_bytes)
+        explanation = self._build_explanation(graph.name, graph.workload_kind, feasible, rejected)
         return PartitionDecisionReport(
             model_name=graph.name,
             workload_kind=graph.workload_kind,
@@ -1181,7 +1513,39 @@ class PartitionPlanner:
             recommended=feasible[0] if feasible else None,
             ranked_candidates=feasible,
             rejected_candidates=rejected,
+            explanation=explanation,
         )
+
+
+def _average_ranks(values: Sequence[float]) -> List[float]:
+    indexed = sorted(enumerate(values), key=lambda item: item[1])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(indexed):
+        j = i + 1
+        while j < len(indexed) and indexed[j][1] == indexed[i][1]:
+            j += 1
+        avg_r = 0.5 * (i + j - 1) + 1.0
+        for k in range(i, j):
+            ranks[indexed[k][0]] = avg_r
+        i = j
+    return ranks
+
+
+def _spearman_rank_corr(xs: Sequence[float], ys: Sequence[float]) -> float:
+    n = len(xs)
+    if n < 2:
+        return 1.0
+    rx = _average_ranks(xs)
+    ry = _average_ranks(ys)
+    mx = sum(rx) / n
+    my = sum(ry) / n
+    num = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    den_x = math.sqrt(sum((a - mx) ** 2 for a in rx))
+    den_y = math.sqrt(sum((b - my) ** 2 for b in ry))
+    if den_x <= 1e-12 or den_y <= 1e-12:
+        return 1.0 if den_x <= 1e-12 and den_y <= 1e-12 else 0.0
+    return float(num / (den_x * den_y))
 
 
 def evaluate_ranking_accuracy(
@@ -1191,7 +1555,12 @@ def evaluate_ranking_accuracy(
     """Compare predicted candidate ranking against hardware-measured throughputs."""
     common = [c for c in report.ranked_candidates if c.plan_id in measured_throughput_by_plan_id]
     if not common:
-        return {"matched_plans": 0, "top1_match": False, "pairwise_concordance": 0.0}
+        return {
+            "matched_plans": 0,
+            "top1_match": False,
+            "pairwise_concordance": 0.0,
+            "spearman_rho": 0.0,
+        }
 
     pred_best = max(common, key=lambda c: c.throughput_tokens_per_sec).plan_id
     meas_best = max(common, key=lambda c: measured_throughput_by_plan_id[c.plan_id]).plan_id
@@ -1202,10 +1571,17 @@ def evaluate_ranking_accuracy(
         for j in range(i + 1, len(common)):
             ci, cj = common[i], common[j]
             dp_pred = ci.throughput_tokens_per_sec - cj.throughput_tokens_per_sec
-            dp_meas = measured_throughput_by_plan_id[ci.plan_id] - measured_throughput_by_plan_id[cj.plan_id]
+            dp_meas = (
+                measured_throughput_by_plan_id[ci.plan_id]
+                - measured_throughput_by_plan_id[cj.plan_id]
+            )
             total_pairs += 1
             if dp_pred * dp_meas >= 0:
                 concordant += 1
+
+    pred_vals = [float(c.throughput_tokens_per_sec) for c in common]
+    meas_vals = [float(measured_throughput_by_plan_id[c.plan_id]) for c in common]
+    spearman = _spearman_rank_corr(pred_vals, meas_vals)
 
     rel_errors = [
         abs(c.throughput_tokens_per_sec - measured_throughput_by_plan_id[c.plan_id])
@@ -1218,6 +1594,7 @@ def evaluate_ranking_accuracy(
         "measured_top1": meas_best,
         "top1_match": pred_best == meas_best,
         "pairwise_concordance": (concordant / float(total_pairs)) if total_pairs > 0 else 1.0,
+        "spearman_rho": spearman,
         "mean_relative_error": sum(rel_errors) / len(rel_errors),
     }
 
@@ -1494,6 +1871,7 @@ __all__ = [
     "CollectiveCostModel",
     "CollectiveKind",
     "HardwareClusterSpec",
+    "HardwareTopologySpec",
     "InferenceConstraints",
     "ModelArchitectureSpec",
     "OperatorBucketMeasurement",
