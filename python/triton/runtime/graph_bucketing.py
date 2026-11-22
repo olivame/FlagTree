@@ -29,6 +29,7 @@ profiling, and OOM recovery integration.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -151,6 +152,10 @@ class GraphBucketCompiler:
         bytes_per_token_activation: int = 0,
         enable_oom_recovery: bool = True,
         model_id: Optional[str] = None,
+        seq_axis: Optional[str] = None,
+        batch_axis: Optional[str] = None,
+        max_paired_step_plans: int = 128,
+        max_compiled_buckets: int = 64,
     ) -> None:
         self.raw_model = model_or_graph
         self.model_id = model_id or getattr(model_or_graph, "__name__", type(model_or_graph).__name__)
@@ -159,6 +164,8 @@ class GraphBucketCompiler:
             int(arg_i): {int(d): str(ax) for d, ax in dim_map.items()}
             for arg_i, dim_map in (dynamic_dims or {}).items()
         }
+        self.seq_axis: Optional[str] = str(seq_axis) if seq_axis is not None else None
+        self.batch_axis: Optional[str] = str(batch_axis) if batch_axis is not None else None
         self.mode = BucketingMode(mode) if isinstance(mode, str) else mode
         caps = get_backend_capabilities()
         all_dyn_axes = {
@@ -178,14 +185,19 @@ class GraphBucketCompiler:
             mode=mode,
             activation_budget_bytes=activation_budget_bytes,
             bytes_per_token_activation=bytes_per_token_activation,
+            max_paired_step_plans=max_paired_step_plans,
         )
         self.use_torch_compile = bool(use_torch_compile)
         self.compile_backend = compile_backend
         self.compile_kwargs = dict(compile_kwargs or {})
+        self.max_compiled_buckets = max(1, int(max_compiled_buckets))
         self.profiler = ShapeProfiler(mode=profiler_mode) if enable_profiler else None
         self.enable_oom_recovery = bool(enable_oom_recovery)
         self.oom_controller = OOMRecoveryController(registry=GLOBAL_FALLBACK_REGISTRY)
         self._compiled_fn: Any = None
+        self._compiled_by_bucket: OrderedDict[str, Any] = OrderedDict()
+        self.bucket_cache_hits: int = 0
+        self.bucket_cache_misses: int = 0
         self._seen_model_keys: Dict[str, ModelCacheKey] = {}
         self.last_plan: Optional[BucketSegmentPlan] = None
         self.last_cache_key: Optional[ModelCacheKey] = None
@@ -207,25 +219,62 @@ class GraphBucketCompiler:
         """Wrap an FX ``GraphModule`` produced by a frontend converter."""
         return cls(graph_module, **kwargs)
 
-    def _get_executor(self) -> Any:
+    @property
+    def compiled_buckets(self) -> int:
+        """Number of distinct compiled bucket graph executors currently cached."""
+        return len(self._compiled_by_bucket)
+
+    def _resolve_seq_axis(self, dims: Mapping[str, int]) -> str:
+        if self.seq_axis is not None:
+            return self.seq_axis
+        if "S" in dims:
+            return "S"
+        if len(dims) == 1:
+            return next(iter(dims))
+        batch_names = {"b", "batch", "batch_size"}
+        if self.batch_axis is not None:
+            batch_names.add(self.batch_axis.lower())
+        for dim_map in self.dynamic_dims.values():
+            for dim_i, ax_name in sorted(dim_map.items()):
+                if ax_name in dims and dim_i > 0 and ax_name.lower() not in batch_names:
+                    return ax_name
+        for ax_name in dims:
+            if ax_name.lower() not in batch_names:
+                return ax_name
+        return "S"
+
+    def _get_executor(self, cache_key: Optional[ModelCacheKey] = None) -> Any:
         if not self.use_torch_compile:
             return self._base_callable
-        if self._compiled_fn is not None:
-            return self._compiled_fn
+        bucket_digest = cache_key.digest() if cache_key is not None else "__default__"
+        cached = self._compiled_by_bucket.get(bucket_digest)
+        if cached is not None:
+            self._compiled_by_bucket.move_to_end(bucket_digest)
+            self.bucket_cache_hits += 1
+            self._compiled_fn = cached
+            return cached
+        compiled_fn: Any = None
         try:
             import torch
             if hasattr(torch, "compile"):
-                self._compiled_fn = torch.compile(
+                compiled_fn = torch.compile(
                     self._base_callable,
                     backend=self.compile_backend,
                     dynamic=True,
                     **self.compile_kwargs,
                 )
-                return self._compiled_fn
         except Exception:
-            pass
-        self._compiled_fn = self._base_callable
-        return self._compiled_fn
+            compiled_fn = None
+        if compiled_fn is None:
+            self._compiled_fn = self._base_callable
+            return self._base_callable
+        self._compiled_by_bucket[bucket_digest] = compiled_fn
+        self._compiled_by_bucket.move_to_end(bucket_digest)
+        while len(self._compiled_by_bucket) > self.max_compiled_buckets:
+            self._compiled_by_bucket.popitem(last=False)
+        self.bucket_cache_misses += 1
+        self._compiled_fn = compiled_fn
+        return compiled_fn
 
     def _extract_dims_and_dtypes(
         self, args: Tuple[Any, ...]
@@ -268,8 +317,16 @@ class GraphBucketCompiler:
         from .. import knobs
 
         dims, dtypes, batch_size = self._extract_dims_and_dtypes(args)
+        if self.batch_axis is not None and self.batch_axis in dims:
+            batch_size = max(1, int(dims[self.batch_axis]))
         self.step_count += 1
-        plan = self.guard.plan_step(dims, batch_size=batch_size, step_id=self.step_count)
+        eff_seq_axis = self._resolve_seq_axis(dims)
+        plan = self.guard.plan_step(
+            dims,
+            batch_size=batch_size,
+            seq_axis=eff_seq_axis,
+            step_id=self.step_count,
+        )
         self.last_plan = plan
 
         # Apply zero-padding segmented mark_dynamic bounds to dynamic tensors
@@ -290,7 +347,7 @@ class GraphBucketCompiler:
         self.last_cache_key = mkey
         self._seen_model_keys[mkey.digest()] = mkey
 
-        executor = self._get_executor()
+        executor = self._get_executor(mkey)
 
         def _invoke() -> Any:
             with knobs.autotuning.scope():
@@ -326,6 +383,10 @@ class GraphBucketCompiler:
             "use_torch_compile": self.use_torch_compile,
             "steps_executed": self.step_count,
             "unique_model_cache_keys": len(self._seen_model_keys),
+            "compiled_buckets": self.compiled_buckets,
+            "bucket_cache_hits": self.bucket_cache_hits,
+            "bucket_cache_misses": self.bucket_cache_misses,
+            "paired_step_plans_cached": len(self.guard._paired_step_plans),
             "profiler": self.profiler.summary() if self.profiler is not None else None,
         }
 

@@ -259,5 +259,111 @@ class TestBucketGuardsTrainAndInfer(unittest.TestCase):
         self.assertEqual(restored, expected)
 
 
+    def test_graph_bucket_compiler_lru_custom_seq_axis_and_compiled_buckets(self):
+        import torch
+        import torch.nn as nn
+        from triton.runtime.graph_bucketing import GraphBucketCompiler
+
+        model = nn.Sequential(nn.Linear(16, 16), nn.ReLU())
+        model.eval()
+
+        comp_lru = GraphBucketCompiler(
+            model,
+            dynamic_dims={0: {0: "B", 1: "seq_len"}},
+            mode=BucketingMode.INFERENCE,
+            use_torch_compile=False,
+            enable_oom_recovery=False,
+            max_paired_step_plans=32,
+        )
+        with torch.no_grad():
+            x = torch.randn(2, 24, 16)
+            for _ in range(100):
+                comp_lru(x)
+        self.assertLessEqual(len(comp_lru.guard._paired_step_plans), 32)
+
+        comp_cap = GraphBucketCompiler(
+            model,
+            dynamic_dims={0: {0: "B", 1: "seq_len"}},
+            mode=BucketingMode.TRAINING,
+            activation_budget_bytes=900 * 1024,
+            bytes_per_token_activation=1024,
+            use_torch_compile=False,
+            enable_oom_recovery=False,
+        )
+        with torch.no_grad():
+            comp_cap(torch.randn(2, 400, 16))
+        self.assertTrue(comp_cap.last_plan.memory_capped)
+        self.assertGreater(comp_cap.last_plan.estimated_activation_bytes, 0)
+        self.assertEqual(comp_cap.last_plan.axis_intervals["seq_len"][1], 450)
+
+        comp_cache = GraphBucketCompiler(
+            model,
+            dynamic_dims={0: {0: "B", 1: "seq_len"}},
+            mode=BucketingMode.INFERENCE,
+            use_torch_compile=True,
+            compile_backend="eager",
+            enable_oom_recovery=False,
+        )
+        with torch.no_grad():
+            for slen in (20, 24, 50, 60):
+                comp_cache(torch.randn(2, slen, 16))
+        self.assertEqual(comp_cache.compiled_buckets, 2)
+        self.assertEqual(comp_cache.summary()["compiled_buckets"], 2)
+        self.assertGreaterEqual(comp_cache.bucket_cache_hits, 2)
+
+    def test_decode_graph_runner_none_capture_fallback_and_device_kv_tensor(self):
+        import torch
+
+        class _NoneAdapter:
+            def capture(self, fn):
+                return None
+
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        def step_fn(inp, kv_lens):
+            return inp + kv_lens.unsqueeze(-1).to(inp.dtype)
+
+        runner_fallback = DecodeGraphBucketRunner(
+            step_fn,
+            batch_buckets=(2, 4),
+            graph_adapter=_NoneAdapter(),
+        )
+        out_f = runner_fallback.run_decode_step(torch.ones(3, 8, device=dev), [10, 20, 30])
+        self.assertEqual(tuple(out_f.shape), (3, 8))
+        self.assertEqual(runner_fallback.capture_count, 0)
+        self.assertEqual(runner_fallback.capture_fallback_count, 1)
+
+        class _TensorGraph:
+            def __init__(self, fn, out):
+                self._fn = fn
+                self.output = out
+
+            def replay(self):
+                self.output.copy_(self._fn())
+
+        class _TensorAdapter:
+            def capture(self, fn):
+                return _TensorGraph(fn, fn().clone())
+
+        runner_dev = DecodeGraphBucketRunner(
+            step_fn,
+            batch_buckets=(4, 8),
+            graph_adapter=_TensorAdapter(),
+        )
+        x1 = torch.ones(3, 8, device=dev)
+        o1 = runner_dev.run_decode_step(x1, [100, 200, 300]).clone()
+        slot = runner_dev._slots[4]
+        self.assertIsInstance(slot.static_kv_lens, torch.Tensor)
+        self.assertEqual(slot.static_kv_lens.device, x1.device)
+        ptr_before = slot.static_kv_lens.data_ptr()
+        self.assertEqual(slot.static_kv_lens.tolist(), [100, 200, 300, 0])
+
+        o2 = runner_dev.run_decode_step(torch.full((2, 8), 2.0, device=dev), [101, 201])
+        self.assertEqual(slot.static_kv_lens.data_ptr(), ptr_before)
+        self.assertEqual(slot.static_kv_lens.tolist(), [101, 201, 0, 0])
+        self.assertTrue(torch.all(slot.static_inputs[2:] == 0).item())
+        self.assertTrue(torch.allclose(o1[:, 0], torch.tensor([101.0, 201.0, 301.0], device=dev)))
+        self.assertTrue(torch.allclose(o2[:, 0], torch.tensor([103.0, 203.0], device=dev)))
+
 if __name__ == "__main__":
     unittest.main()

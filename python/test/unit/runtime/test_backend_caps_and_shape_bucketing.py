@@ -309,3 +309,150 @@ def test_heuristics_never_treats_block_tile_config_as_dynamic():
     # Must NEVER evaluate 1 % 1 == 0 -> True!
     assert ev["FULL_M_TILES"] is False
     assert ev["FULL_K_TILES"] is True
+def test_interval_policy_1d_align_sig_and_singleton_isolation():
+    from triton.runtime.shape_bucketing import IntervalPolicy, IntervalSegment
+
+    gid = "N=512|K=512::dtypes=torch.bfloat16"
+    pol = IntervalPolicy(
+        dynamic_axis="M",
+        groups={
+            gid: [
+                IntervalSegment(lo=1, hi=128, config_index=0, representative=64),
+                IntervalSegment(lo=129, hi=512, config_index=1, representative=256),
+            ]
+        },
+        divisibility=16,
+        backend="ppu",
+    )
+    k_aligned = pol.lookup_autotune_key(
+        {"M": 256, "N": 512, "K": 512}, ["M", "N", "K"], extra_dtypes=("torch.bfloat16",)
+    ).bucket_key
+    k_unaligned = pol.lookup_autotune_key(
+        {"M": 264, "N": 512, "K": 512}, ["M", "N", "K"], extra_dtypes=("torch.bfloat16",)
+    ).bucket_key
+    assert k_aligned == k_unaligned
+
+    k_one = pol.lookup_autotune_key(
+        {"M": 1, "N": 512, "K": 512}, ["M", "N", "K"], extra_dtypes=("torch.bfloat16",)
+    ).bucket_key
+    k_two = pol.lookup_autotune_key(
+        {"M": 2, "N": 512, "K": 512}, ["M", "N", "K"], extra_dtypes=("torch.bfloat16",)
+    ).bucket_key
+    assert k_one != k_two
+
+
+def test_group_frontier_contiguous_partition_and_gap_routing():
+    from triton.runtime.shape_bucketing import IntervalPolicy, group_frontier
+
+    shapes = [32, 64, 128, 256, 512, 1024]
+    timings = [
+        [1.0, 5.0, 9.0],
+        [1.1, 5.0, 9.0],
+        [6.0, 1.0, 5.0],
+        [6.0, 1.2, 5.0],
+        [9.0, 6.0, 1.0],
+        [9.0, 6.0, 1.1],
+    ]
+    segs = group_frontier(shapes, timings, max_buckets=3)
+    assert len(segs) == 3
+    for idx in range(1, len(segs)):
+        assert segs[idx].lo == segs[idx - 1].hi + 1
+    assert segs[0].lo == 32 and segs[-1].hi == 1024
+
+    gid = "N=512::dtypes=torch.bfloat16"
+    pol = IntervalPolicy(dynamic_axis="M", groups={gid: segs}, backend="ppu")
+    r96 = pol.lookup_autotune_key({"M": 96, "N": 512}, ["M", "N"], extra_dtypes=("torch.bfloat16",))
+    r384 = pol.lookup_autotune_key({"M": 384, "N": 512}, ["M", "N"], extra_dtypes=("torch.bfloat16",))
+    assert r96.bucket_key[5] == 1
+    assert r384.bucket_key[5] == 2
+
+
+def test_interval_policy_normalize_entry_scalar_group_aware_and_nd():
+    from triton.runtime.shape_bucketing import IntervalPolicy, IntervalSegment
+
+    gid_a = "N=512|K=512::dtypes=torch.bfloat16"
+    gid_b = "N=4096|K=4096::dtypes=torch.bfloat16"
+    pol = IntervalPolicy(
+        dynamic_axis="M",
+        groups={
+            gid_a: [IntervalSegment(1, 128, 0, 64), IntervalSegment(129, 1024, 1, 512)],
+            gid_b: [
+                IntervalSegment(1, 64, 0, 32),
+                IntervalSegment(65, 256, 1, 128),
+                IntervalSegment(257, 1024, 2, 512),
+            ],
+        },
+        divisibility=16,
+        backend="ppu",
+    )
+    t_bf16 = _DummyTensor((100, 4096), "torch.bfloat16")
+    tok_b = pol.normalize_entry_scalar(
+        "M", 100, is_autotuned_key=True, all_args={"A": t_bf16, "M": 100, "N": 4096, "K": 4096}
+    )
+    tok_a = pol.normalize_entry_scalar(
+        "M", 100, is_autotuned_key=True, all_args={"A": t_bf16, "M": 100, "N": 512, "K": 512}
+    )
+    tok_unseen = pol.normalize_entry_scalar(
+        "M", 100, is_autotuned_key=True, all_args={"A": t_bf16, "M": 100, "N": 8192, "K": 8192}
+    )
+    assert tok_b[:3] == ("ft_pgo_int", 65, 256)
+    assert tok_a[:3] == ("ft_pgo_int", 1, 128)
+    assert tok_unseen[0] == "ft_tune_int"
+
+    nd_gid = "::dtypes="
+    nd_pol = IntervalPolicy(
+        dynamic_axis="B",
+        groups={nd_gid: [IntervalSegment(1, 8, 0, 4)]},
+        dynamic_axes=("B", "S"),
+        axis_groups={
+            "B": {nd_gid: [IntervalSegment(1, 8, 0, 4)]},
+            "S": {nd_gid: [IntervalSegment(1, 200, 0, 128), IntervalSegment(201, 1024, 1, 512)]},
+        },
+        backend="ppu",
+    )
+    tok_s = nd_pol.normalize_entry_scalar("S", 150, is_autotuned_key=True, all_args={"B": 4, "S": 150})
+    assert tok_s[:3] == ("ft_pgo_int", 1, 200)
+
+
+def test_interval_policy_per_op_fallback_isolation(tmp_path):
+    from triton.runtime.adjust_kernel_param import bucket_axes
+    from triton.runtime.shape_bucketing import (
+        IntervalPolicy,
+        IntervalSegment,
+        clear_policy_caches,
+        resolve_tuner_policy,
+    )
+
+    @bucket_axes(M="dynamic_tile_dim", N="dynamic_tile_dim", head_dim="invariant_const")
+    def op_bmm(A, M, N, head_dim):
+        return A
+
+    @bucket_axes(M="dynamic_tile_dim", N="invariant_const", K="invariant_const")
+    def op_mm(A, M, N, K):
+        return A
+
+    class _MockTuner:
+        def __init__(self, fn, keys):
+            self.fn = fn
+            self.base_fn = fn
+            self.jit_function = fn
+            self.keys = keys
+            self.configs = []
+
+    clear_policy_caches()
+    pgo_file = tmp_path / "shared.json"
+    IntervalPolicy(
+        dynamic_axis="M",
+        groups={"N=512::dtypes=torch.bfloat16": [IntervalSegment(1, 256, 0, 128)]},
+        backend="ppu",
+    ).save_json(pgo_file)
+
+    pol_bmm = resolve_tuner_policy(_MockTuner(op_bmm, ["M", "N", "head_dim"]), policy_path=str(pgo_file))
+    pol_mm = resolve_tuner_policy(_MockTuner(op_mm, ["M", "N", "K"]), policy_path=str(pgo_file))
+    assert pol_bmm.fallback_policy is not pol_mm.fallback_policy
+    assert len(pol_mm.fallback_policy.axis_specs) > 0
+
+    pol_bmm.observe_args({"M": 72, "N": 72, "head_dim": 64})
+    pol_bmm.observe_args({"M": 116, "N": 116, "head_dim": 64})
+    assert not pol_mm.is_axis_dynamic("N", 768)
+    assert pol_mm.normalize_entry_scalar("N", 768, is_autotuned_key=True) == (int, 768)

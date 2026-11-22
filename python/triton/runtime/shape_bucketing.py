@@ -1107,9 +1107,13 @@ def group_frontier(
     if num_configs == 0:
         raise ValueError("timings_matrix must contain at least one candidate config")
     k_max = max(1, min(int(max_buckets), n))
-    w = [float(x) for x in weights] if weights is not None else [1.0] * n
+    raw_w = [float(x) for x in weights] if weights is not None else [1.0] * n
+    order = sorted(range(n), key=lambda idx: int(shapes[idx]))
+    sorted_shapes = [int(shapes[idx]) for idx in order]
+    sorted_timings = [timings_matrix[idx] for idx in order]
+    w = [raw_w[idx] for idx in order]
 
-    oracle = [min(timings_matrix[i]) for i in range(n)]
+    oracle = [min(sorted_timings[i]) for i in range(n)]
 
     cost = [[0.0] * n for _ in range(n)]
     best_cfg = [[0] * n for _ in range(n)]
@@ -1119,7 +1123,7 @@ def group_frontier(
         for j in range(i, n):
             wj = w[j]
             oracle_sum += wj * oracle[j]
-            row = timings_matrix[j]
+            row = sorted_timings[j]
             best_val = math.inf
             best_idx = 0
             for c in range(num_configs):
@@ -1166,12 +1170,17 @@ def group_frontier(
         cur_start = split[b][cur_end]
         cfg_idx = best_cfg[cur_start][cur_end]
         mid_idx = (cur_start + cur_end) // 2
+        if cur_start > 0 and sorted_shapes[cur_start - 1] < sorted_shapes[cur_start]:
+            seg_lo = sorted_shapes[cur_start - 1] + 1
+        else:
+            seg_lo = sorted_shapes[cur_start]
+        seg_hi = sorted_shapes[cur_end]
         segments.append(
             IntervalSegment(
-                lo=int(shapes[cur_start]),
-                hi=int(shapes[cur_end]),
+                lo=seg_lo,
+                hi=seg_hi,
                 config_index=cfg_idx,
-                representative=int(shapes[mid_idx]),
+                representative=sorted_shapes[mid_idx],
                 regret_ms=float(cost[cur_start][cur_end]),
             )
         )
@@ -1206,6 +1215,38 @@ def allocate_budget(
     return alloc
 
 
+def _select_interval_segment(
+    segs: Sequence[IntervalSegment],
+    val: int,
+) -> Tuple[IntervalSegment, DispatchStatus]:
+    """Select the interval covering ``val`` with gap-safe ceiling fallback."""
+    if val < segs[0].lo:
+        return segs[0], DispatchStatus.UNDERFLOW
+    if val > segs[-1].hi:
+        return segs[-1], DispatchStatus.OVERFLOW
+    for seg in segs:
+        if seg.lo <= val <= seg.hi:
+            return seg, DispatchStatus.HIT
+    for seg in segs:
+        if val <= seg.hi:
+            return seg, DispatchStatus.HIT
+    return segs[-1], DispatchStatus.HIT
+
+
+def _parse_pgo_group_id(gid: str) -> Tuple[bool, Tuple[Tuple[str, str], ...], str]:
+    """Parse ``format_group_id`` strings into ``(has_schema, static_kv_pairs, dtypes_str)``."""
+    if "::dtypes=" not in gid:
+        return False, (), ""
+    static_part, dt_part = gid.split("::dtypes=", 1)
+    pairs: List[Tuple[str, str]] = []
+    if static_part:
+        for item in static_part.split("|"):
+            if "=" in item:
+                k, v = item.split("=", 1)
+                pairs.append((k, v))
+    return True, tuple(pairs), dt_part
+
+
 class IntervalPolicy:
     """Profile-guided interval bucket policy with online fallback for unseen groups."""
 
@@ -1236,16 +1277,68 @@ class IntervalPolicy:
                     str(gk): tuple(sorted(segs, key=lambda s: s.lo))
                     for gk, segs in gmap.items()
                 }
+        self._parsed_groups: Dict[str, Tuple[bool, Tuple[Tuple[str, str], ...], str]] = {
+            gid: _parse_pgo_group_id(gid) for gid in self.groups
+        }
+        self._parsed_axis_groups: Dict[str, Dict[str, Tuple[bool, Tuple[Tuple[str, str], ...], str]]] = {
+            ax: {gid: _parse_pgo_group_id(gid) for gid in gmap}
+            for ax, gmap in self.axis_groups.items()
+        }
         self.backend = backend if backend is not None else _active_backend_name()
         resolved_div = _default_divisibility(self.backend) if divisibility is None else int(divisibility)
         self.divisibility = max(1, resolved_div)
         self.op_name = op_name
+        self._has_custom_fallback: bool = fallback_policy is not None
         self.fallback_policy = fallback_policy or OnlineBucketPolicy(
             divisibility=self.divisibility,
             backend=self.backend,
             op_name=self.op_name,
             dynamic_axes=self.dynamic_axes,
         )
+
+    def bind_op(
+        self,
+        *,
+        op_name: str = "unknown",
+        axis_specs: Optional[Mapping[str, Any]] = None,
+        mode: BucketingMode = BucketingMode.AUTO,
+        divisibility: Optional[int] = None,
+    ) -> "IntervalPolicy":
+        """Return an op-isolated view sharing immutable interval tables with an isolated fallback."""
+        eff_div = self.divisibility if divisibility is None else max(1, int(divisibility))
+        specs = dict(axis_specs or {})
+        inferred_invariants = {
+            name
+            for name, spec in specs.items()
+            if getattr(getattr(spec, "role", None), "value", getattr(spec, "role", None)) == "invariant_const"
+        }
+        inherited_dyn = [
+            ax for ax in self.fallback_policy._explicit_dynamic_axes if ax not in inferred_invariants
+        ]
+        isolated_fb = OnlineBucketPolicy(
+            specs,
+            mode=mode,
+            divisibility=eff_div,
+            backend=self.backend,
+            op_name=op_name,
+            dynamic_axes=inherited_dyn,
+        )
+        for ax in self.fallback_policy._unaligned_axes:
+            if ax not in inferred_invariants:
+                isolated_fb._unaligned_axes.add(ax)
+        bound = IntervalPolicy.__new__(IntervalPolicy)
+        bound.dynamic_axis = self.dynamic_axis
+        bound.dynamic_axes = self.dynamic_axes
+        bound.groups = self.groups
+        bound.axis_groups = self.axis_groups
+        bound._parsed_groups = self._parsed_groups
+        bound._parsed_axis_groups = self._parsed_axis_groups
+        bound.backend = self.backend
+        bound.divisibility = eff_div
+        bound.op_name = op_name
+        bound._has_custom_fallback = True
+        bound.fallback_policy = isolated_fb
+        return bound
 
     @staticmethod
     def format_group_id(
@@ -1288,21 +1381,14 @@ class IntervalPolicy:
                         clamped_axes=res.clamped_axes,
                     )
                 val = int(args[ax])
-                if val < segs[0].lo:
-                    chosen = segs[0]
+                chosen, seg_st = _select_interval_segment(segs, val)
+                if seg_st is DispatchStatus.UNDERFLOW:
                     clamped_list.append(ax)
                     if eff_status is DispatchStatus.HIT:
                         eff_status = DispatchStatus.UNDERFLOW
-                elif val > segs[-1].hi:
-                    chosen = segs[-1]
+                elif seg_st is DispatchStatus.OVERFLOW:
                     clamped_list.append(ax)
                     eff_status = DispatchStatus.OVERFLOW
-                else:
-                    chosen = segs[-1]
-                    for seg in segs:
-                        if seg.lo <= val <= seg.hi:
-                            chosen = seg
-                            break
                 rep_dims[ax] = chosen.representative
                 key_parts.append((ax, chosen.lo, chosen.hi, chosen.config_index, val == 1))
             return BucketLookupResult(
@@ -1328,24 +1414,15 @@ class IntervalPolicy:
             )
 
         val = int(args[self.dynamic_axis])
-        status = DispatchStatus.HIT
-        clamped: Tuple[str, ...] = ()
-        if val < segs[0].lo:
-            chosen = segs[0]
-            status = DispatchStatus.UNDERFLOW
-            clamped = (self.dynamic_axis,)
-        elif val > segs[-1].hi:
-            chosen = segs[-1]
-            status = DispatchStatus.OVERFLOW
-            clamped = (self.dynamic_axis,)
-        else:
-            chosen = segs[-1]
-            for seg in segs:
-                if seg.lo <= val <= seg.hi:
-                    chosen = seg
-                    break
+        chosen, status = _select_interval_segment(segs, val)
+        clamped: Tuple[str, ...] = (
+            (self.dynamic_axis,)
+            if status in (DispatchStatus.UNDERFLOW, DispatchStatus.OVERFLOW)
+            else ()
+        )
 
-        align_sig = (val == 1, (val % self.divisibility) == 0)
+        # Tile-config selection depends on interval and ==1 (GEMV/decode),
+        # NOT %divisibility alignment (which is enforced at JIT/LibEntry level).
         bkey = (
             "ft_pgo_v1",
             self.backend,
@@ -1353,8 +1430,7 @@ class IntervalPolicy:
             chosen.lo,
             chosen.hi,
             chosen.config_index,
-            align_sig[0],
-            align_sig[1],
+            val == 1,
         )
         return BucketLookupResult(
             bucket_key=bkey,
@@ -1385,9 +1461,75 @@ class IntervalPolicy:
     def is_axis_dynamic(self, axis_name: str, value: Any) -> bool:
         if type(value) is not int or value <= 1 or _is_config_constexpr_key(axis_name):
             return False
+        spec = self.fallback_policy.axis_specs.get(axis_name)
+        role_val = getattr(getattr(spec, "role", None), "value", getattr(spec, "role", None))
+        if role_val == "invariant_const":
+            return False
         if axis_name in self.dynamic_axes:
             return True
         return self.fallback_policy.is_axis_dynamic(axis_name, value)
+
+    def _resolve_group_segments(
+        self,
+        param_name: str,
+        all_args: Optional[Mapping[str, Any]],
+        *,
+        group_id: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[Tuple[IntervalSegment, ...]]]:
+        if len(self.dynamic_axes) > 1 and self.axis_groups:
+            gmap = self.axis_groups.get(param_name)
+            parsed_map = self._parsed_axis_groups.get(param_name, {})
+        elif param_name == self.dynamic_axis:
+            gmap = self.groups
+            parsed_map = self._parsed_groups
+        else:
+            return None, None
+        if not gmap:
+            return None, None
+
+        if group_id is not None:
+            segs = gmap.get(group_id)
+            return (group_id, segs) if segs else (None, None)
+
+        if all_args is None:
+            if len(gmap) == 1:
+                only_gid = next(iter(gmap))
+                return only_gid, gmap[only_gid]
+            return None, None
+
+        arg_dtypes = extract_tensor_dtypes(all_args.values())
+        arg_dt_str = ",".join(arg_dtypes)
+        exact_matches: List[Tuple[int, str, Tuple[IntervalSegment, ...]]] = []
+        static_only_matches: List[Tuple[int, str, Tuple[IntervalSegment, ...]]] = []
+        unstructured: List[Tuple[str, Tuple[IntervalSegment, ...]]] = []
+
+        for gid, segs in gmap.items():
+            if not segs:
+                continue
+            has_schema, static_pairs, dt_str = parsed_map.get(gid) or _parse_pgo_group_id(gid)
+            if not has_schema:
+                unstructured.append((gid, segs))
+                continue
+            if any((k not in all_args) or (str(all_args[k]) != v_str) for k, v_str in static_pairs):
+                continue
+            if dt_str == arg_dt_str:
+                exact_matches.append((len(static_pairs), gid, segs))
+            elif (not arg_dtypes) and dt_str:
+                static_only_matches.append((len(static_pairs), gid, segs))
+
+        if exact_matches:
+            exact_matches.sort(key=lambda item: item[0], reverse=True)
+            _, best_gid, best_segs = exact_matches[0]
+            return best_gid, best_segs
+        if static_only_matches:
+            max_spec = max(item[0] for item in static_only_matches)
+            top = [item for item in static_only_matches if item[0] == max_spec]
+            if len(top) == 1:
+                return top[0][1], top[0][2]
+            return None, None
+        if len(gmap) == 1 and len(unstructured) == 1:
+            return unstructured[0]
+        return None, None
 
     def normalize_entry_scalar(
         self,
@@ -1396,8 +1538,17 @@ class IntervalPolicy:
         *,
         is_autotuned_key: bool,
         all_args: Optional[Mapping[str, Any]] = None,
+        group_id: Optional[str] = None,
     ) -> Tuple[Any, ...]:
-        if not is_autotuned_key or param_name != self.dynamic_axis:
+        if not is_autotuned_key:
+            return self.fallback_policy.normalize_entry_scalar(
+                param_name,
+                value,
+                is_autotuned_key=is_autotuned_key,
+                all_args=all_args,
+            )
+        _matched_gid, segs = self._resolve_group_segments(param_name, all_args, group_id=group_id)
+        if not segs:
             return self.fallback_policy.normalize_entry_scalar(
                 param_name,
                 value,
@@ -1407,16 +1558,12 @@ class IntervalPolicy:
         width = int_width_tag(value)
         is_one = value == 1
         is_aligned = (value % self.divisibility) == 0
-        for segs in self.groups.values():
-            for seg in segs:
-                if seg.lo <= value <= seg.hi:
-                    return ("ft_pgo_int", seg.lo, seg.hi, is_one, is_aligned, width)
-        return self.fallback_policy.normalize_entry_scalar(
-            param_name,
-            value,
-            is_autotuned_key=is_autotuned_key,
-            all_args=all_args,
-        )
+        fb = self.fallback_policy
+        bhi, _ = fb.bucket_dim_value(param_name, value)
+        if (param_name, bhi) in fb._unaligned_buckets or param_name in fb._unaligned_axes:
+            is_aligned = False
+        chosen, _status = _select_interval_segment(segs, int(value))
+        return ("ft_pgo_int", chosen.lo, chosen.hi, is_one, is_aligned, width)
 
     def to_dict(self) -> Dict[str, Any]:
         def _ser_groups(gmap):
@@ -1552,32 +1699,7 @@ def clear_policy_caches() -> None:
     _POLICY_FILE_CACHE.clear()
 
 
-def resolve_tuner_policy(
-    tuner: Any,
-    *,
-    explicit_policy: Optional[Any] = None,
-    policy_path: Optional[str] = None,
-    mode_str: Optional[str] = None,
-    divisibility: Optional[int] = None,
-) -> Any:
-    """Resolve explicit, JSON-configured, or cached AST-guided ``OnlineBucketPolicy``."""
-    if explicit_policy is not None:
-        return explicit_policy
-    if policy_path:
-        cached_file = _POLICY_FILE_CACHE.get(policy_path)
-        if cached_file is None:
-            cached_file = IntervalPolicy.load_json(policy_path)
-            _POLICY_FILE_CACHE[policy_path] = cached_file
-        return cached_file
-
-    mode = BucketingMode.parse(mode_str)
-    active_bk = _active_backend_name()
-    eff_div = _default_divisibility(active_bk) if divisibility is None else int(divisibility)
-    slot_key = (mode.value, eff_div, active_bk)
-    local_cache = getattr(tuner, "_ft_shape_policies", None)
-    if isinstance(local_cache, dict) and slot_key in local_cache:
-        return local_cache[slot_key]
-
+def _infer_tuner_axis_specs_and_name(tuner: Any) -> Tuple[Dict[str, Any], str]:
     from .adjust_kernel_param import infer_bucketable_axes
 
     jit_fn = getattr(tuner, "jit_function", None) or getattr(tuner, "fn", tuner)
@@ -1597,6 +1719,80 @@ def resolve_tuner_policy(
     while not callable(base_fn) and hasattr(base_fn, "fn"):
         base_fn = base_fn.fn
     op_name = getattr(base_fn, "__name__", "unknown")
+    return specs, op_name
+
+
+def resolve_tuner_policy(
+    tuner: Any,
+    *,
+    explicit_policy: Optional[Any] = None,
+    policy_path: Optional[str] = None,
+    mode_str: Optional[str] = None,
+    divisibility: Optional[int] = None,
+) -> Any:
+    """Resolve explicit, JSON-configured, or cached AST-guided ``OnlineBucketPolicy``."""
+    mode = BucketingMode.parse(mode_str)
+    active_bk = _active_backend_name()
+    eff_div = _default_divisibility(active_bk) if divisibility is None else int(divisibility)
+    local_cache = getattr(tuner, "_ft_shape_policies", None) if tuner is not None else None
+
+    if explicit_policy is not None:
+        if (
+            isinstance(explicit_policy, IntervalPolicy)
+            and not explicit_policy._has_custom_fallback
+            and tuner is not None
+        ):
+            exp_slot = ("pgo_explicit", id(explicit_policy), mode.value, eff_div, active_bk)
+            if isinstance(local_cache, dict) and exp_slot in local_cache:
+                return local_cache[exp_slot]
+            specs, op_name = _infer_tuner_axis_specs_and_name(tuner)
+            bound = explicit_policy.bind_op(
+                op_name=op_name,
+                axis_specs=specs,
+                mode=mode,
+                divisibility=divisibility,
+            )
+            try:
+                if not isinstance(local_cache, dict):
+                    local_cache = {}
+                    setattr(tuner, "_ft_shape_policies", local_cache)
+                local_cache[exp_slot] = bound
+            except Exception:
+                pass
+            return bound
+        return explicit_policy
+
+    if policy_path:
+        cached_file = _POLICY_FILE_CACHE.get(policy_path)
+        if cached_file is None:
+            cached_file = IntervalPolicy.load_json(policy_path)
+            _POLICY_FILE_CACHE[policy_path] = cached_file
+        if tuner is None:
+            return cached_file.bind_op(mode=mode, divisibility=divisibility)
+        file_slot = ("pgo_file", policy_path, mode.value, eff_div, active_bk)
+        if isinstance(local_cache, dict) and file_slot in local_cache:
+            return local_cache[file_slot]
+        specs, op_name = _infer_tuner_axis_specs_and_name(tuner)
+        bound = cached_file.bind_op(
+            op_name=op_name,
+            axis_specs=specs,
+            mode=mode,
+            divisibility=divisibility,
+        )
+        try:
+            if not isinstance(local_cache, dict):
+                local_cache = {}
+                setattr(tuner, "_ft_shape_policies", local_cache)
+            local_cache[file_slot] = bound
+        except Exception:
+            pass
+        return bound
+
+    slot_key = (mode.value, eff_div, active_bk)
+    if isinstance(local_cache, dict) and slot_key in local_cache:
+        return local_cache[slot_key]
+
+    specs, op_name = _infer_tuner_axis_specs_and_name(tuner)
     policy = OnlineBucketPolicy(
         specs,
         mode=mode,

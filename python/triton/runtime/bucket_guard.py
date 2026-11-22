@@ -34,6 +34,7 @@ Provides three complementary mechanisms:
 from __future__ import annotations
 
 import bisect
+from collections import OrderedDict
 import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -69,6 +70,7 @@ class SymbolicBucketGuard:
         mode: BucketingMode = BucketingMode.AUTO,
         activation_budget_bytes: Optional[int] = None,
         bytes_per_token_activation: int = 0,
+        max_paired_step_plans: int = 128,
     ) -> None:
         self.policy = policy or OnlineBucketPolicy(mode=mode)
         self.activation_budget_bytes = (
@@ -77,7 +79,8 @@ class SymbolicBucketGuard:
             else None
         )
         self.bytes_per_token_activation = max(0, int(bytes_per_token_activation))
-        self._paired_step_plans: Dict[int, BucketSegmentPlan] = {}
+        self.max_paired_step_plans = max(0, int(max_paired_step_plans))
+        self._paired_step_plans: OrderedDict[int, BucketSegmentPlan] = OrderedDict()
 
     def segment_bounds(self, axis_name: str, value: int) -> Tuple[int, int]:
         """Return closed ``(lo, hi)`` bucket interval containing ``value``."""
@@ -98,7 +101,7 @@ class SymbolicBucketGuard:
         dims: Mapping[str, int],
         *,
         batch_size: int = 1,
-        seq_axis: str = "S",
+        seq_axis: Optional[str] = "S",
         step_id: Optional[int] = None,
     ) -> BucketSegmentPlan:
         """Compute segmented ``[lo, hi]`` bounds with optional activation memory cap."""
@@ -109,17 +112,24 @@ class SymbolicBucketGuard:
         capped = False
         splits = 1
 
-        if seq_axis in intervals and self.bytes_per_token_activation > 0:
-            lo_s, hi_s = intervals[seq_axis]
+        eff_seq_axis = seq_axis
+        if eff_seq_axis is None:
+            if "S" in intervals:
+                eff_seq_axis = "S"
+            elif len(intervals) == 1:
+                eff_seq_axis = next(iter(intervals))
+
+        if eff_seq_axis is not None and eff_seq_axis in intervals and self.bytes_per_token_activation > 0:
+            lo_s, hi_s = intervals[eff_seq_axis]
             eff_b = max(1, int(batch_size))
             est_bytes = eff_b * hi_s * self.bytes_per_token_activation
             if self.activation_budget_bytes is not None and est_bytes > self.activation_budget_bytes:
                 max_safe_s = self.activation_budget_bytes // max(1, eff_b * self.bytes_per_token_activation)
-                actual_s = max(1, int(dims[seq_axis]))
+                actual_s = max(1, int(dims[eff_seq_axis]))
                 if max_safe_s >= actual_s:
                     # Tighten ceiling hi_s so Dynamo/Inductor upper-bound buffers stay under budget!
                     hi_s = max(lo_s, int(max_safe_s))
-                    intervals[seq_axis] = (lo_s, hi_s)
+                    intervals[eff_seq_axis] = (lo_s, hi_s)
                     est_bytes = eff_b * hi_s * self.bytes_per_token_activation
                     capped = True
                 else:
@@ -133,8 +143,12 @@ class SymbolicBucketGuard:
             memory_capped=capped,
             recommended_microbatch_splits=splits,
         )
-        if step_id is not None:
-            self._paired_step_plans[int(step_id)] = plan
+        if step_id is not None and self.max_paired_step_plans > 0:
+            sid = int(step_id)
+            self._paired_step_plans[sid] = plan
+            self._paired_step_plans.move_to_end(sid)
+            while len(self._paired_step_plans) > self.max_paired_step_plans:
+                self._paired_step_plans.popitem(last=False)
         return plan
 
     def get_paired_backward_plan(self, step_id: int) -> Optional[BucketSegmentPlan]:
@@ -173,11 +187,28 @@ class SymbolicBucketGuard:
         return active_plan
 
 
+def _infer_tensor_device(obj: Any) -> Optional[Any]:
+    """Recursively find the first tensor device inside a pytree of inputs."""
+    if hasattr(obj, "device") and hasattr(obj, "new_zeros") and hasattr(obj, "copy_"):
+        return obj.device
+    if isinstance(obj, dict):
+        for v in obj.values():
+            dev = _infer_tensor_device(v)
+            if dev is not None:
+                return dev
+    elif isinstance(obj, (tuple, list)):
+        for v in obj:
+            dev = _infer_tensor_device(v)
+            if dev is not None:
+                return dev
+    return None
+
+
 @dataclass
 class _CapturedBucketSlot:
     bucket_batch: int
     static_inputs: Any
-    static_kv_lens: List[int]
+    static_kv_lens: Any
     static_output: Any = None
     graph_obj: Any = None
     replays: int = 0
@@ -212,6 +243,7 @@ class DecodeGraphBucketRunner:
         self._graph_adapter = graph_adapter
         self._slots: Dict[int, _CapturedBucketSlot] = {}
         self.capture_count: int = 0
+        self.capture_fallback_count: int = 0
         self.replay_count: int = 0
         self.eager_overflow_count: int = 0
 
@@ -250,6 +282,18 @@ class DecodeGraphBucketRunner:
             for d_el, s_el in zip(dst, src):
                 self._default_copy(d_el, s_el, actual_b)
             return
+        if hasattr(dst, "copy_") and hasattr(dst, "zero_") and hasattr(dst, "shape"):
+            try:
+                import torch
+                with torch.no_grad():
+                    dst[:actual_b].copy_(src[:actual_b])
+                    if actual_b < dst.shape[0]:
+                        dst[actual_b:].zero_()
+            except Exception:
+                dst[:actual_b].copy_(src[:actual_b])
+                if actual_b < dst.shape[0]:
+                    dst[actual_b:].zero_()
+            return
         if hasattr(dst, "__setitem__"):
             dst[:actual_b] = src[:actual_b]
 
@@ -262,34 +306,84 @@ class DecodeGraphBucketRunner:
             return tuple(self._default_slice(v, actual_b) for v in out)
         return out[:actual_b]
 
-    def run_decode_step(self, batch_inputs: Any, kv_seqlens: Sequence[int]) -> Any:
+    def _allocate_static_kv_lens(self, bucket_b: int, batch_inputs: Any, kv_seqlens: Any) -> Any:
+        target_dev = _infer_tensor_device(kv_seqlens)
+        if target_dev is None:
+            target_dev = _infer_tensor_device(batch_inputs)
+        if target_dev is not None:
+            try:
+                import torch
+                kv_dtype = (
+                    kv_seqlens.dtype
+                    if (
+                        isinstance(kv_seqlens, torch.Tensor)
+                        and kv_seqlens.dtype in (torch.int32, torch.int64)
+                    )
+                    else torch.int32
+                )
+                return torch.zeros((bucket_b,), dtype=kv_dtype, device=target_dev)
+            except Exception:
+                pass
+        return [0] * bucket_b
+
+    def _update_static_kv_lens(
+        self,
+        static_kv: Any,
+        kv_seqlens: Any,
+        actual_b: int,
+        bucket_b: int,
+    ) -> None:
+        if hasattr(static_kv, "copy_") and hasattr(static_kv, "zero_"):
+            import torch
+            with torch.no_grad():
+                if isinstance(kv_seqlens, torch.Tensor):
+                    if actual_b > 0:
+                        src = kv_seqlens[:actual_b]
+                        if src.dtype != static_kv.dtype:
+                            src = src.to(dtype=static_kv.dtype)
+                        static_kv[:actual_b].copy_(src)
+                    if actual_b < bucket_b:
+                        static_kv[actual_b:].zero_()
+                else:
+                    padded = [int(kv_seqlens[i]) for i in range(actual_b)] + [0] * (bucket_b - actual_b)
+                    src_cpu = torch.tensor(padded, dtype=static_kv.dtype)
+                    static_kv.copy_(src_cpu)
+            return
+        for i in range(actual_b):
+            static_kv[i] = int(kv_seqlens[i])
+        for i in range(actual_b, bucket_b):
+            static_kv[i] = 0
+
+    def run_decode_step(self, batch_inputs: Any, kv_seqlens: Any) -> Any:
         """Execute one autoregressive Decode step using the tightest batch-bucket slot."""
-        actual_b = len(kv_seqlens)
+        actual_b = int(kv_seqlens.shape[0]) if hasattr(kv_seqlens, "shape") else len(kv_seqlens)
         if actual_b == 0:
             return batch_inputs
         bucket_b = self.select_batch_bucket(actual_b)
         if bucket_b is None:
             # Overflow above max configured Decode graph bucket -> safe unpadded eager fallback
             self.eager_overflow_count += 1
-            return self.step_fn(batch_inputs, list(kv_seqlens))
+            kv_arg = kv_seqlens if hasattr(kv_seqlens, "copy_") else list(kv_seqlens)
+            return self.step_fn(batch_inputs, kv_arg)
 
         slot = self._slots.get(bucket_b)
         if slot is None:
             static_in = self._default_allocate(bucket_b, batch_inputs)
-            static_kv = [0] * bucket_b
+            static_kv = self._allocate_static_kv_lens(bucket_b, batch_inputs, kv_seqlens)
             self._default_copy(static_in, batch_inputs, actual_b)
-            for i in range(actual_b):
-                static_kv[i] = int(kv_seqlens[i])
-            for i in range(actual_b, bucket_b):
-                static_kv[i] = 0  # Dummy slot mask: zero valid KV tokens!
+            self._update_static_kv_lens(static_kv, kv_seqlens, actual_b, bucket_b)
 
             graph_obj = None
             if self._graph_adapter is not None:
                 graph_obj = self._graph_adapter.capture(
                     lambda: self.step_fn(static_in, static_kv)
                 )
+            if graph_obj is not None:
                 static_out = graph_obj.output
+                self.capture_count += 1
             else:
+                if self._graph_adapter is not None:
+                    self.capture_fallback_count += 1
                 static_out = self.step_fn(static_in, static_kv)
             slot = _CapturedBucketSlot(
                 bucket_batch=bucket_b,
@@ -300,15 +394,11 @@ class DecodeGraphBucketRunner:
                 replays=0,
             )
             self._slots[bucket_b] = slot
-            self.capture_count += 1
             return self._default_slice(slot.static_output, actual_b)
 
         # In-place metadata & input update before replay
         self._default_copy(slot.static_inputs, batch_inputs, actual_b)
-        for i in range(actual_b):
-            slot.static_kv_lens[i] = int(kv_seqlens[i])
-        for i in range(actual_b, bucket_b):
-            slot.static_kv_lens[i] = 0
+        self._update_static_kv_lens(slot.static_kv_lens, kv_seqlens, actual_b, bucket_b)
 
         if slot.graph_obj is not None:
             slot.graph_obj.replay()
