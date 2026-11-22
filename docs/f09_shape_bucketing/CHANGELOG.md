@@ -4,7 +4,38 @@ All notable changes for the FlagOS **F09 (Universal & Portable Dynamic Shape Buc
 
 ---
 
-## [F09 Release v0.9.0-f09] — 2026-11-22
+## [v0.2.0-f09] — 2026-11-22
+
+### Documentation & Release Notes (`docs/f09-v020-release-notes`)
+- Updated `CHANGELOG.md`, `KNOWN_ISSUES.md`, `README.md`, and `DESIGN_AND_MAINTENANCE.md` for immutable release **`v0.2.0-f09`** (0 Python runtime/test files modified).
+- Marked **KI-01** (Jina `aiu_load_mask`), **KI-07** (`IntervalPolicy` Auto-PGO & `GraphBucketCompiler`/`DecodeGraphBucketRunner`), and **KI-08** (`cache.py` concurrent eviction lock) as **RESOLVED in `v0.2.0-f09`** with real-model PPU-ZW810E verification numbers (`USE_FLAGTUNE_COST_MODEL=0`).
+
+### FT-P1-B (`e4522a5fc1a83bd35d2f2a8f6f04cd757287dc91`) — 2026-11-22
+- **Inter-Process Binary Cache Lock (`cache.py`)**:
+  - Added POSIX `fcntl.flock` + in-process `threading.RLock` hybrid lock (`_cache_root_lock` on `.flagtree_cache.lock`, graceful thread-lock fallback on non-POSIX): `FileCacheManager.put()` holds shared `LOCK_SH` with atomic `os.replace()` and `shutil.rmtree(ignore_errors=True)`, while `enforce_binary_cache_budget()` holds exclusive `LOCK_EX`.
+  - Preserved **100% lock-free warm reads** (`has_file()`, `get_file()`, `get_group()`). 6-process × 30-iter × 3-round stress repro (`max_cache_entries=3`): **15 `FileNotFoundError` crashes -> 0 exceptions, 0 budget overshoots, `warm_read_lockfree=True`** (resolves KI-08).
+- **Core Vendor Dehardcoding & FP8 `min_dot_size` Contract (`backend_caps.py`, `shape_bucketing.py`, `_distributed.py`, `autotuner.py`, `adjust_kernel_param.py`)**:
+  - Added `fp8_min_dot_size` (`(16, 16, 32)` default / `(64, 16, 32)` MUSA), `min_dot_size_for_dtype(dtype)` / `get_min_dot_size()`, `supports_cudagraph_bench` (`False` for `ppu`/`thead`, `True` default), `extra_config_constexpr_keys` (`("aiu_load_mask",)` for `ppu`/`thead`), and `torch_extension_module` (`"torch_npu"` for `ascend`, etc.) to `BackendBucketingCapabilities`.
+  - Removed all hardcoded `"aiu_load_mask"` from `shape_bucketing.py`, `import torch_npu` from `_distributed.py`, and 30 source / 10 signature XPU leaks from `autotuner.py` (replaced with generic `**backend_kwargs` forwarding).
+- **Tests**: Expanded FlagTree F09 6-file unit suite from 45 to **48/48 PASSED** (0 failed, 0 skipped; 0 lines `>120` chars).
+
+### FT-P1-A (`9b92bd75dc7e01b7ada6cb15196f8ac69e83f863`) — 2026-11-22
+- **Auto-PGO `IntervalPolicy` & `group_frontier()` Fixes (`shape_bucketing.py`)**:
+  - Unified 1D `IntervalPolicy.lookup_autotune_key()` by removing redundant `(val % divisibility) == 0` while preserving `val == 1` singleton isolation (eliminating 2× redundant cold tuning between aligned and unaligned shapes in the same interval).
+  - Fixed `group_frontier()` DP interval construction so consecutive segments satisfy `lo = prev_hi + 1` with zero uncovered gaps and zero overlap, plus `_select_interval_segment()` safe routing for legacy policy JSONs.
+  - Fixed `IntervalPolicy.normalize_entry_scalar()` to honor explicit `group_id`, match `all_args` static dimensions + Tensor dtypes across both 1D `groups` and N-D `axis_groups`, and fall back cleanly on unseen groups.
+  - Added `IntervalPolicy.bind_op()` so `resolve_tuner_policy()` isolates per-op `OnlineBucketPolicy` fallbacks with AST-inferred `axis_specs`, preventing cross-op dynamic-axis pollution.
+- **Graph Bucketing & Decode Runner Fixes (`graph_bucketing.py`, `bucket_guard.py`)**:
+  - Bounded `SymbolicBucketGuard._paired_step_plans` with an `OrderedDict` LRU (`max_paired_step_plans=128`), wired configurable `seq_axis` into memory-cap enforcement, and added real `_compiled_by_bucket` LRU caching (`compiled_buckets`, hit/miss counters) in `GraphBucketCompiler`.
+  - Hardened `DecodeGraphBucketRunner` with safe eager fallback when `graph_adapter.capture()` returns `None` (`capture_fallback_count`), static device `torch.Tensor` `static_kv_lens` updated in-place via `.copy_()` (stable `data_ptr()`), and trailing padding-row zeroing on batch shrink.
+- **Real-Model Auto-PGO V2 Verification (PPU-10/11, `USE_FLAGTUNE_COST_MODEL=0`)**:
+  - `bge_reranker_v2_m3`: 11,109 real `ShapeProfiler` samples, `4/4` groups, `7/7` `ft_pgo_v1` hits; `COLD_TUNED` `33 -> 14 (-57.6%)`, cold `60,108.1 -> 54,073.0 ms (1.11×)`, unseen `13,400.7 -> 274.6 ms (48.80×, 0 new_hgbin, 0 cold_tuned)`, steady `1.115×`, `cos_vs_aten = 0.999983`.
+  - `qwen3_embedding_0_6b`: 43,659 real `ShapeProfiler` samples, `5/5` groups, `10/10` `ft_pgo_v1` hits; 6-len `COLD_TUNED` `65 -> 38 (-41.5%)`, cold `104,355.2 -> 91,892.7 ms (1.14×, 3.9s faster than ON)`, unseen `2,582.3 -> 1,667.9 ms (19.47×)`, steady `1.105×` (beats ON `1.092×`), `min_cos_pgo_vs_off = 1.000000`; policy-covered 7-len A/B `1,995.0 ms vs 1,994.6 ms (1.000× exact parity, 0 cold_tuned)` (resolves KI-07).
+- **Tests**: 6/6 repros BEFORE FAIL -> AFTER PASS; FlagTree 6-file unit suite expanded 39 -> **45/45 PASSED**.
+
+---
+
+## [v0.1.0-f09] (F09 Release v0.9.0-f09) — 2026-11-22
 
 ### Documentation, Governance & Security (`docs/f09-docs-and-release-notes`)
 - Added bilingual CN + EN Quick Start & Overview guide (`docs/f09_shape_bucketing/README.md`) covering supported environments, environment knobs, isolated installation, runnable minimal example with expected output, unit test commands, and troubleshooting (§9.1).

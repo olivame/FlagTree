@@ -37,7 +37,7 @@ FlagTree F09 为 Triton/FlagTree 编译器运行时提供**架构无关、可移
 | --- | --- | --- |
 | **Python / PyTorch / Triton** | **Verified** | Python 3.12.3, PyTorch 2.10.0, Triton 3.6.0, FlagTree 0.7.0 base (`e86aa7cf`), pytest 7.2.0 |
 | **Container Runtime (Reference)** | **Verified** | `flagrt/thead-ppu-runtime:1.0.0-ppu3.6-py312-torch2.10.0-flagtree0.7.0-triton3.6.0-x86_64` (`sha256:1ba7ead15378160ba9aa1dafcfb77686de6b16732590ffab062bab19c60c32b8`) |
-| **T-Head PPU-ZW810E (1 / 3 / 4 cards)** | **Verified (HW)** | Full FlagTree F09 unit suite (39/39), FlagGems op/training suite (21/21), multi-model E2E & DDP (`gloo`) |
+| **T-Head PPU-ZW810E (1 / 3 / 4 cards)** | **Verified (HW)** | Full FlagTree F09 unit suite (48/48), FlagGems op/training suite (25/25), multi-model E2E & DDP (`gloo`) |
 | **NVIDIA CUDA / AMD ROCm / Ascend NPU / XPU / MLU / MUSA** | **Portable / Pending HW Sign-off** | Backend capability profiles & portable unit tests pass; dedicated physical hardware CI verification pending (see [KNOWN_ISSUES.md](./KNOWN_ISSUES.md#ki-05)) |
 
 ### Dependencies / 依赖说明
@@ -162,7 +162,7 @@ dist.destroy_process_group()
 
 ## 6. Running Unit Tests / 运行单元测试
 
-Run all 6 FlagTree F09 unit test suites (39 tests total) against an isolated `--target` installation:
+Run all 6 FlagTree F09 unit test suites (48 tests total) against an isolated `--target` installation:
 
 ```bash
 USE_FLAGTUNE_COST_MODEL=0 PYTHONPATH=/tmp/f09_isolated pytest -v \
@@ -174,7 +174,7 @@ USE_FLAGTUNE_COST_MODEL=0 PYTHONPATH=/tmp/f09_isolated pytest -v \
     python/test/flagtune/test_partition_planner.py
 ```
 
-Expected result: **`39 passed, 0 failed`**.
+Expected result: **`48 passed, 0 failed`**.
 
 ---
 

@@ -10,14 +10,14 @@
 
 | ID | 标题 / Summary | 严重级别 | 状态 |
 | --- | --- | :---: | :---: |
-| [KI-01](#ki-01) | Jina 系列模型因 `aiu_load_mask` 对齐翻转触发 Warmup 后额外重编译 | Medium | Open (Tracked) |
+| [KI-01](#ki-01) | Jina 系列模型因 `aiu_load_mask` 对齐翻转触发 Warmup 后额外重编译 | Medium | **RESOLVED in `v0.2.0-f09`** |
 | [KI-02](#ki-02) | T-Head PPU 多卡环境 `nccl` 后端出现 `ncclInternalError`（当前多卡验证基于 `gloo`） | Medium | Open (Vendor Runtime Boundary) |
 | [KI-03](#ki-03) | 离线/受限网络环境下 FlagTune Cost Model 预加载阻塞（需设置 `USE_FLAGTUNE_COST_MODEL=0`） | High (Ops) | Mitigated via Env |
 | [KI-04](#ki-04) | `PartitionPlanner` 当前为离线解析规划器，尚未直连在线分布式执行框架 | Low (Scope) | Planned (Phase 2) |
 | [KI-05](#ki-05) | 真机硬件验证边界：当前仅在单芯片平台（T-Head PPU-ZW810E）完成实机验证 | Medium (Scope) | Planned (Multi-Chip CI) |
 | [KI-06](#ki-06) | `DistributedDispatchGuard` 需对称进入受保护算子，NCCL/FlagCX 下建议显式初始化隔离 PG | Low (Usage) | Documented Contract |
-| [KI-07](#ki-07) | `IntervalPolicy` 全局策略单文件映射与 `GraphBucketCompiler` / `DecodeGraphBucketRunner` 图捕获边界 | Medium | Planned (Phase 2) |
-| [KI-08](#ki-08) | 多进程共享 `TRITON_CACHE_DIR` 开启磁盘预算淘汰时缺少跨进程文件锁 | Low (Ops) | Planned (Phase 2) |
+| [KI-07](#ki-07) | `IntervalPolicy` 全局策略单文件映射与 `GraphBucketCompiler` / `DecodeGraphBucketRunner` 图捕获边界 | Medium | **RESOLVED in `v0.2.0-f09`** |
+| [KI-08](#ki-08) | 多进程共享 `TRITON_CACHE_DIR` 开启磁盘预算淘汰时缺少跨进程文件锁 | Low (Ops) | **RESOLVED in `v0.2.0-f09`** |
 
 ---
 
@@ -31,7 +31,7 @@
 - **复现方式**：在 `FLAGTREE_SHAPE_BUCKETING=1` 下，仅使用非 16 对齐长度集合（如 `[264, 380, 524, 764]`）预热 `jina-reranker-v2-base` 或 `jina-embeddings-v3`，随后输入 16 对齐长度（如 `L=288`、`L=576`）。`_thead/ops/bmm.py` 的 `@libtuner(key=[..., "aiu_load_mask", ...])` 中 `aiu_load_mask` 从 `1/2` 翻转为 `3`，导致 2 个 `bmm` 算子 × 2 个桶触发 `COLD_TUNED=4` 与 `+62 .hgbin` 编译抖动。
 - **规避方法**：在预热阶段为目标模型同时覆盖 16 对齐与非 16 对齐代表长度（例如每个桶额外包含一个 `S % 16 == 0` 样本），或对固定长度服务将序列显式 pad 至 16 的倍数。
 - **责任人**：FlagTree / FlagGems F09 算子分桶维护小组（`@olivame` / FlagGems `_thead` 后端维护者）。
-- **整改计划**：在二期迭代中将 `aiu_load_mask` 从 `@libtuner` 缓存键解耦或通过 `warmup_buckets()` 自动生成双对齐预热清单，并补充 Jina 零重编译回归测试（目标版本：`v0.10-f09.1`）。
+- **整改计划**：**已于 `v0.2.0-f09` 解决（RESOLVED）**。FlagGems `FG-P1-A` (`13590357eb`) 已将 `aiu_load_mask` 从 `_thead/ops/bmm.py` 的 `@libtuner(key=...)` 与 4 个核函数签名彻底解耦，FlagTree `FT-P1-B` (`e4522a5fc1`) 已将 `"aiu_load_mask"` 移出核心 `shape_bucketing.py` 并收敛至 `BackendBucketingCapabilities.extra_config_constexpr_keys`。PPU-8/9 真机复测（`USE_FLAGTUNE_COST_MODEL=0`）：`jina_reranker_v2_base` R0 预热后 `COLD_TUNED 4 -> 0`、`post_warm_new_hgbin +62 -> 0`、`hit_rate 99.70% -> 100.00%`、`post_warm_first 42,961.15 ms -> 428.34 ms`（`100.3×`）、`max_step 41,598.52 ms -> 40.26 ms`（`stall_reduction 1.41× -> 2,019.79×`）、稳态 `1.092×`（`cos_vs_aten=0.999968`）、R2-B Zipf P99 `24,706.07 ms -> 4,890.91 ms`（原 4 档 `5.05×`）及 `-> 42.50 ms`（推荐 7 档 `581.4×`，`cold_tuned=0`）、重启 `new_hgbin=0`（`9.14×`）；`jina_embeddings_v3` R0 `COLD_TUNED 4 -> 0`、`post_warm_new_hgbin +62 -> 0`、`hit_rate 99.89% -> 100.00%`、`post_warm_first 45,220.22 ms -> 1,483.83 ms`（`30.5×`，`1.068×` 超越 OFF）、`max_step 42,877.15 ms -> 128.80 ms`（`stall_reduction 1.74× -> 747.39×`）、稳态 `1.119×`（`cos_vs_aten=0.999314`, `cos_vs_off=0.999845`）、R2-B Zipf P99 `25,684.37 ms -> 4,035.08 ms`（`6.37×`）及 `-> 133.99 ms`（`191.7×`，`cold_tuned=0`）、重启 `new_hgbin=0`（`8.14×`），达成全量 **18/18（100%）真实模型零重编译**里程碑。
 
 ### KI-02
 
@@ -71,7 +71,7 @@
 - **复现方式**：检查本交付包全部实机测试记录可见，所有真实硬件算子精度、多模型 E2E 及多卡测试均在 T-Head PPU-ZW810E（1/3/4 卡）完成；其余后端仅通过 `BackendBucketingCapabilities` 契约与架构无关单元测试验证。
 - **规避方法**：在目标新硬件上线前，使用隔离安装命令（`install_f09_editable.sh --target`）运行 FlagTree 全部 6 个单元测试文件及 FlagGems 算子回归，并通过 `register_backend_capabilities()` 核对目标芯片的 `divisibility`、`min_dot_size`（例如 FP8 `tl.dot` 的 `K >= 32` 约束）与 `alignment_spec_tags`。
 - **责任人**：FlagOS F09 跨后端验收与 CI 维护团队（`@olivame` + 各硬件后端 Maintainer）。
-- **整改计划**：在交付《兼容性矩阵》与《例外记录》中清晰标注各后端为“待实机验证”；待多芯片 CI Runner 就绪后，优先补齐 NVIDIA CUDA 与 Ascend NPU 的端到端实机验证流水线。
+- **整改计划**：`v0.2.0-f09` (`FT-P1-B` `e4522a5fc1`) 已补齐 `BackendBucketingCapabilities.fp8_min_dot_size`（`K >= 32`）与核心运行时去硬编码（`extra_config_constexpr_keys`、`torch_extension_module`、`supports_cudagraph_bench`、`autotuner.py` 通用 `**backend_kwargs`），但在交付《兼容性矩阵》与《例外记录》中仍严格标注非 PPU 后端为“待实机验证”；待多芯片 CI Runner 就绪后，优先补齐 NVIDIA CUDA 与 Ascend NPU 的端到端实机验证流水线。
 
 ### KI-06
 
@@ -91,7 +91,7 @@
 - **复现方式**：(1) `IntervalPolicy` Schema `flagtree.shape_policy.v1` 当前为单策略文件共享，未按算子名分表且 1D PGO 键包含对齐标志位，未见非对齐长度可能触发额外冷调优；(2) `DecodeGraphBucketRunner` 当前使用 Python `list` 更新 `static_kv_lens` 并在捕获失败返回 `None` 时未降级 eager；`GraphBucketCompiler` 当前主要验证 `backend="eager"` 路径，且 `plan_step` 配对历史需手动清理。
 - **规避方法**：生产变长推理/训练优先使用默认在线策略 `OnlineBucketPolicy`（`FLAGTREE_SHAPE_BUCKETING=1`，不设置 `FLAGTREE_SHAPE_POLICY_PATH`）；`GraphBucketCompiler` 与 `DecodeGraphBucketRunner` 当前仅作为实验性图级分桶组件使用。
 - **责任人**：FlagTree F09 运行时维护者（`@olivame`）。
-- **整改计划**：二期迭代升级 `flagtree.shape_policy.v2`（支持 per-op key、连续区间覆盖与对齐键统一），并将 `DecodeGraphBucketRunner` 的 `static_kv_lens` 迁移为静态设备 Tensor `.copy_()` 更新及增加 capture-fail eager 降级（目标版本：`v0.10-f09.2`）。
+- **整改计划**：**已于 `v0.2.0-f09` 解决（RESOLVED）**。FlagTree `FT-P1-A` (`9b92bd75dc`) 已修复全部 6 项核心缺陷：(1) 移除 1D `IntervalPolicy` 键中冗余 `align_sig[1]`（保留 `M=1` 单例隔离）；(2) `group_frontier()` 生成零空洞连续覆盖区间；(3) `normalize_entry_scalar()` 按 `group_id` 与 `all_args` 静态维度/dtype 精确匹配 1D/N-D 策略组；(4) 新增 `IntervalPolicy.bind_op()` 隔离每算子回退策略；(5) `GraphBucketCompiler` 增加 `_paired_step_plans` LRU 上界（`<=128`）、自定义 `seq_axis` 显存上限与 `_compiled_by_bucket` 编译缓存；(6) `DecodeGraphBucketRunner` 支持 `graph_obj is None` 安全回退 eager、静态设备 Tensor `static_kv_lens` 原地 `.copy_()` 更新及缩批尾行清零。PPU-10/11 真实模型 Auto-PGO V2 闭环验证（`USE_FLAGTUNE_COST_MODEL=0`）：`bge_reranker_v2_m3`（`11,109` 真实样本、`4/4` 组、`7/7` `ft_pgo_v1` 命中）`COLD_TUNED 33 -> 14 (-57.6%)`、冷启 `60,108.1 -> 54,073.0 ms (1.11×)`、未见长度 `13,400.7 -> 274.6 ms (48.80×, 0 new_hgbin, 0 cold_tuned)`、稳态 `1.115×`（`cos_vs_aten=0.999983`）；`qwen3_embedding_0_6b`（`43,659` 真实样本、`5/5` 组、`10/10` `ft_pgo_v1` 命中）6 档 `COLD_TUNED 65 -> 38 (-41.5%)`、冷启 `104,355.2 -> 91,892.7 ms (1.14×，比 ON 快 3.9s)`、未见长度 `2,582.3 -> 1,667.9 ms (19.47×)`、稳态 `1.105×`（超越 ON `1.092×`）、`min_cos_pgo_vs_off=1.000000`，策略全覆盖 7 档 A/B 实现 `1,995.0 ms vs 1,994.6 ms`（`1.000×` 精确持平、`0` 调优，彻底消除倒挂）。注：生产级 `torch.compile(backend="inductor")` 与硬件 CUDA/PPU Graph 端到端重放仍保持为既有范围边界，待后续框架集成专项扩展。
 
 ### KI-08
 
@@ -101,4 +101,4 @@
 - **复现方式**：多个进程同时调用 `cache.py` 中 `put_group()` 触发 `enforce_binary_cache_budget()`，因当前淘汰删除（`shutil.rmtree`）未加跨进程文件锁（`fcntl.flock`），存在一个进程删除另一进程正在加载的缓存条目的竞态窗口。
 - **规避方法**：多卡运行开启磁盘缓存预算时，为每个 Rank 指定独立缓存目录（例如 `TRITON_CACHE_DIR=/tmp/triton_cache/rank_${RANK}`），或在共享缓存目录下保持磁盘预算关闭（默认 `None`）。
 - **责任人**：FlagTree 缓存子系统维护者（`@olivame`）。
-- **整改计划**：后续为 `enforce_binary_cache_budget()` 增加跨进程 `fcntl.flock` 锁及延迟淘汰宽限期，并补充多进程并发压力单元测试（目标版本：`v0.10-f09.1`）。
+- **整改计划**：**已于 `v0.2.0-f09` 解决（RESOLVED）**。FlagTree `FT-P1-B` (`e4522a5fc1`) 在 `python/triton/runtime/cache.py` 中新增 POSIX `fcntl.flock` + 进程内 `threading.RLock` 混合锁 `_cache_root_lock`（冷写 `put()` 持有共享锁 `LOCK_SH` 并采用原子 `os.replace()` 与 `shutil.rmtree(ignore_errors=True)`，预算淘汰 `enforce_binary_cache_budget()` 持有排他锁 `LOCK_EX`，同时保持 `has_file()`/`get_file()`/`get_group()` **100% 无锁热读**）。6 进程 × 30 轮 × 3 次并发淘汰压测（`max_cache_entries=3`）：BEFORE **15 次 `FileNotFoundError`** → AFTER **0 异常、0 预算超限、`warm_read_lockfree=True`**，并已纳入 `test_runtime_bucketing_and_cache_budget.py`（FlagTree 单测总计 **48/48 PASS**）。注：无 `lockd` 的旧版 NFS 仍自动降级为进程内线程锁，此类网络文件系统建议继续按 Rank 隔离 `TRITON_CACHE_DIR`。

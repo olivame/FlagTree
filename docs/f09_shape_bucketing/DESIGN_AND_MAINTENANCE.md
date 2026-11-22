@@ -76,7 +76,7 @@ FlagTree F09 organizes dynamic shape bucketing into four decoupled runtime layer
 | `python/triton/runtime/__init__.py` | PR-1..4, Fix-3 | Public runtime API re-exports |
 | `python/triton/flagtune/__init__.py` | PR-4 | Public `PartitionPlanner` & cost-model re-exports |
 
-### 2.2 Unit Test Suites (6 files, 39 tests)
+### 2.2 Unit Test Suites (6 files, 48 tests)
 | Test File | Coverage |
 | --- | --- |
 | `python/test/unit/runtime/test_backend_caps_and_shape_bucketing.py` | Capability registry, AST heuristics, `OnlineBucketPolicy`, `IntervalPolicy`, deterministic callable `cache_key`, tile `constexpr` exclusion |
@@ -160,7 +160,7 @@ Lookup precedence in `get_backend_capabilities(backend)`:
 
 ### 6.1 Upstream Baseline & Ordered Commit Stack
 - **Upstream Base**: `FlagTree@e86aa7cf` (Triton 3.6.0 / FlagTree 0.7.0)
-- **Ordered F09 Stack** (7 code commits + 1 docs commit):
+- **Ordered F09 Stack (`v0.2.0-f09`)** (9 code commits + 2 docs commits = 11 commits):
   1. `b99e75cb` — PR-1: `backend_caps.py` + `shape_bucketing.py` + `BaseBackend` hook
   2. `e42e6213` — PR-2: `jit.py`, `autotuner.py`, `adjust_kernel_param.py`, `cache.py`, `knobs.py` integration
   3. `28a520ce` — PR-3: `_distributed.py`, `_async_compile.py`, `errors.py`
@@ -168,6 +168,10 @@ Lookup precedence in `get_backend_capabilities(backend)`:
   5. `afa43e63` — Fix-1: `IntervalPolicy` delegation & guard PG isolation
   6. `74843e00` — Fix-2: deterministic callable `constexpr` `cache_key` & tile `constexpr` protection
   7. `61534d97` — Fix-3: non-collective `get_default_dispatch_guard()`, eager `init_default_dispatch_guard()`, re-entrant `dispatch_guard_scope()`, and 0 `>120`-char CI lint compliance
+  8. `b04da1ef` — Docs (`v0.1.0-f09`): bilingual F09 guide, design/maintenance docs, known issues, changelog, and `SECURITY.md`
+  9. `9b92bd75` — FT-P1-A: Auto-PGO `IntervalPolicy` / `group_frontier()` fixes, `GraphBucketCompiler` LRU cache & `seq_axis`, and `DecodeGraphBucketRunner` eager fallback / static device Tensor `static_kv_lens`
+  10. `e4522a5f` — FT-P1-B: POSIX `fcntl.flock` binary cache eviction lock, FP8 `min_dot_size` (`K >= 32`), and core vendor dehardcoding
+  11. `v0.2.0-f09` Docs: updated `CHANGELOG.md`, `KNOWN_ISSUES.md` (KI-01/KI-07/KI-08 RESOLVED), `README.md`, and `DESIGN_AND_MAINTENANCE.md`
 
 ### 6.2 Rebasing onto a Newer Upstream FlagTree / Triton Release
 1. **Primary conflict hotspots** (only 6 upstream-modified files contain F09 hooks; the other 11 runtime files are self-contained F09 additions):
