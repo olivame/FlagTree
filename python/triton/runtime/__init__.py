@@ -29,16 +29,25 @@ from .autotuner import (Autotuner, Config, Heuristics, autotune, heuristics)
 from .cache import RedisRemoteCacheBackend, RemoteCacheBackend
 from .driver import driver
 from .jit import JITFunction, KernelInterface, MockTensor, TensorWrapper, reinterpret
-from .errors import CompileTimeoutError, OutOfResources, InterpreterError
+from .errors import (
+    CompileTimeoutError,
+    DistributedCommTimeoutError,
+    DistributedRankFaultError,
+    InterpreterError,
+    OutOfResources,
+)
 from ._distributed import (
     CoordinatedDispatchDecision,
+    CoordinatedStepGuard,
     DistributedDispatchGuard,
+    DistributedFaultCoordinator,
     DistributedRtContext,
     FallbackRecord,
     GLOBAL_FALLBACK_REGISTRY,
     OOMRecoveryController,
     PerfRiskLevel,
     RankDispatchState,
+    StepHealthDecision,
     dispatch_guard_scope,
     get_default_dispatch_guard,
     init_default_dispatch_guard,
@@ -81,14 +90,19 @@ __all__ = [
     # flagtree tle distributed
     "DistributedRtContext",
     "CompileTimeoutError",
+    "DistributedCommTimeoutError",
+    "DistributedRankFaultError",
     "CoordinatedDispatchDecision",
+    "CoordinatedStepGuard",
     "DistributedDispatchGuard",
+    "DistributedFaultCoordinator",
     "FallbackRecord",
     "GLOBAL_COMPILE_BLACKLIST",
     "GLOBAL_FALLBACK_REGISTRY",
     "OOMRecoveryController",
     "PerfRiskLevel",
     "RankDispatchState",
+    "StepHealthDecision",
     "dispatch_guard_scope",
     "get_default_dispatch_guard",
     "init_default_dispatch_guard",

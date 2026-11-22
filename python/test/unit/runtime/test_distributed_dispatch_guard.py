@@ -478,3 +478,384 @@ def test_two_rank_gloo_asymmetric_get_default_dispatch_guard_no_deadlock():
         for r, p in enumerate(procs):
             out, err = p.communicate(timeout=15)
             assert p.returncode == 0, f"rank {r} failed ({p.returncode}):\n{out}\n{err}"
+def test_distributed_fault_errors_attributes_and_pickling():
+    import pickle
+    from triton.runtime import (
+        DistributedCommTimeoutError,
+        DistributedRankFaultError,
+    )
+
+    err_to = DistributedCommTimeoutError(
+        rank=2,
+        world_size=4,
+        op="all_reduce_bitmask",
+        phase="dispatch_negotiate",
+        timeout_s=3.0,
+        cause="Operation timed out!",
+    )
+    assert err_to.rank == 2
+    assert err_to.world_size == 4
+    assert err_to.op == "all_reduce_bitmask"
+    assert err_to.phase == "dispatch_negotiate"
+    assert err_to.timeout_s == 3.0
+    assert "timed out" in str(err_to).lower()
+    rt_to = pickle.loads(pickle.dumps(err_to))
+    assert (rt_to.rank, rt_to.world_size, rt_to.op, rt_to.phase, rt_to.timeout_s, rt_to.cause) == (
+        2,
+        4,
+        "all_reduce_bitmask",
+        "dispatch_negotiate",
+        3.0,
+        "Operation timed out!",
+    )
+
+    err_rf = DistributedRankFaultError(
+        rank=1,
+        world_size=4,
+        op="check_step_health",
+        phase="training",
+        timeout_s=3.0,
+        cause="Connection closed by peer",
+    )
+    assert err_rf.rank == 1
+    assert err_rf.world_size == 4
+    assert err_rf.timeout_s == 3.0
+    assert "rank fault" in str(err_rf).lower()
+    rt_rf = pickle.loads(pickle.dumps(err_rf))
+    assert (rt_rf.rank, rt_rf.world_size, rt_rf.op, rt_rf.phase, rt_rf.timeout_s, rt_rf.cause) == (
+        1,
+        4,
+        "check_step_health",
+        "training",
+        3.0,
+        "Connection closed by peer",
+    )
+
+
+def test_dispatch_guard_comm_timeout_and_degraded_solo_circuit_breaker():
+    from triton.runtime import (
+        DistributedCommTimeoutError,
+        DistributedRankFaultError,
+    )
+    from triton.runtime._distributed import FallbackRegistry
+
+    # 1. raise_on_fault=True trips DistributedCommTimeoutError within bounded time
+    reg1 = FallbackRegistry()
+
+    def _stall_reduce(_mask: int) -> int:
+        time.sleep(2.0)
+        return 0
+
+    guard1 = DistributedDispatchGuard(
+        world_size=4,
+        rank=1,
+        all_reduce_or_fn=_stall_reduce,
+        comm_timeout_s=0.25,
+        raise_on_fault=True,
+        fallback_registry=reg1,
+    )
+    t0 = time.monotonic()
+    raised = None
+    try:
+        guard1.negotiate(RankDispatchState.ALL_HOT_HIT)
+    except DistributedCommTimeoutError as exc:
+        raised = exc
+    elapsed = time.monotonic() - t0
+    assert raised is not None
+    assert elapsed < 1.2
+    assert raised.rank == 1 and raised.world_size == 4 and raised.timeout_s == 0.25
+    assert guard1.degraded_solo
+    assert guard1.fault_count == 1
+    assert reg1.summary()["total_fallbacks"] == 1
+    assert reg1.summary()["records"][0]["recovery_action"] == "abort_comm_timeout"
+
+    # 2. raise_on_fault=False degrades cleanly to degraded_solo without hanging
+    reg2 = FallbackRegistry()
+    barrier_calls = []
+    guard2 = DistributedDispatchGuard(
+        world_size=4,
+        rank=0,
+        all_reduce_or_fn=_stall_reduce,
+        barrier_fn=lambda: barrier_calls.append(1),
+        comm_timeout_s=0.2,
+        raise_on_fault=False,
+        fallback_registry=reg2,
+    )
+    dec = guard2.negotiate(RankDispatchState.ANY_COLD_COMPILE)
+    assert dec.degraded_solo
+    assert dec.agreed_fallback
+    assert dec.fault_kind == "comm_timeout"
+    assert not dec.barrier_completed
+    assert guard2.post_compile_sync(dec) is False
+    assert barrier_calls == []
+    assert reg2.summary()["records"][0]["recovery_action"] == "degrade_solo_comm_timeout"
+    guard2.reset_fault_state()
+    assert not guard2.degraded_solo
+
+    # 3. Peer rank fault maps to DistributedRankFaultError + structured audit
+    reg3 = FallbackRegistry()
+
+    def _broken_peer(_mask: int) -> int:
+        raise ConnectionResetError("Connection reset by peer")
+
+    guard3 = DistributedDispatchGuard(
+        world_size=4,
+        rank=2,
+        all_reduce_or_fn=_broken_peer,
+        comm_timeout_s=1.0,
+        raise_on_fault=True,
+        fallback_registry=reg3,
+    )
+    rf_exc = None
+    try:
+        guard3.negotiate(RankDispatchState.ALL_HOT_HIT)
+    except DistributedRankFaultError as exc:
+        rf_exc = exc
+    assert rf_exc is not None
+    assert rf_exc.rank == 2 and rf_exc.world_size == 4
+    assert reg3.summary()["records"][0]["recovery_action"] == "abort_rank_fault"
+
+
+def test_coordinated_step_guard_8_rank_asymmetric_oom_and_error_recovery():
+    from triton.runtime import (
+        CoordinatedStepGuard,
+        DistributedCommTimeoutError,
+        DistributedFaultCoordinator,
+    )
+    from triton.runtime._distributed import FallbackRegistry
+
+    assert DistributedFaultCoordinator is CoordinatedStepGuard
+
+    world_size = 8
+    barrier = threading.Barrier(world_size)
+    shared = [[0] * world_size for _ in range(world_size)]
+    reg = FallbackRegistry()
+
+    def make_reduce_fn(r: int):
+        def _reduce(vec):
+            shared[r] = list(vec)
+            barrier.wait()
+            out = [max(shared[k][i] for k in range(world_size)) for i in range(world_size)]
+            barrier.wait()
+            return out
+
+        return _reduce
+
+    # 1. Rank 5 hits OOM -> all 8 ranks synchronously split microbatches & commit
+    committed = [0] * world_size
+    splits_used = [0] * world_size
+    results = [None] * world_size
+
+    def oom_worker(r: int) -> None:
+        sg = CoordinatedStepGuard(
+            world_size=world_size,
+            rank=r,
+            comm_timeout_s=2.0,
+            fallback_registry=reg,
+            all_reduce_status_fn=make_reduce_fn(r),
+        )
+
+        def step_fn():
+            if r == 5:
+                raise RuntimeError("CUDA out of memory on long-tail S=2047")
+            return "full"
+
+        def split_fn(chunks: int):
+            splits_used[r] = chunks
+            return f"split_{chunks}"
+
+        def post_ok_fn(val):
+            committed[r] += 1
+            return val
+
+        res, health = sg.run_coordinated_step(
+            "varlen_train",
+            "training",
+            work_units=8,
+            step_fn=step_fn,
+            split_fn=split_fn,
+            post_ok_fn=post_ok_fn,
+            shape=(8, 2047, 128),
+            bucket_key=("ft_bkt_v1", 2047),
+        )
+        assert health.all_ok
+        results[r] = res
+
+    threads = [threading.Thread(target=oom_worker, args=(r,)) for r in range(world_size)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+        assert not t.is_alive()
+
+    assert all(c == 1 for c in committed)
+    assert all(s == 2 for s in splits_used)
+    assert all(v == "split_2" for v in results)
+    assert reg.summary()["total_fallbacks"] >= world_size * 2
+
+    # 2. Rank 2 hits non-OOM error -> all 8 ranks safely skip commit without deadlock
+    skipped_commits = [0] * world_size
+    skip_decisions = [None] * world_size
+
+    def err_worker(r: int) -> None:
+        sg = CoordinatedStepGuard(
+            world_size=world_size,
+            rank=r,
+            comm_timeout_s=2.0,
+            fallback_registry=reg,
+            all_reduce_status_fn=make_reduce_fn(r),
+        )
+
+        def step_fn():
+            if r == 2:
+                raise ValueError("transient NaN corruption")
+            return "ok"
+
+        _, health = sg.run_coordinated_step(
+            "varlen_train_err",
+            "training",
+            work_units=8,
+            step_fn=step_fn,
+            post_ok_fn=lambda v: skipped_commits.__setitem__(r, skipped_commits[r] + 1),
+        )
+        skip_decisions[r] = health
+
+    threads2 = [threading.Thread(target=err_worker, args=(r,)) for r in range(world_size)]
+    for t in threads2:
+        t.start()
+    for t in threads2:
+        t.join(timeout=5.0)
+        assert not t.is_alive()
+
+    assert all(c == 0 for c in skipped_commits)
+    assert all(d.any_error and d.error_ranks == (2,) and d.recommended_action == "skip_step" for d in skip_decisions)
+
+    # 3. Stalled status reduction trips DistributedCommTimeoutError cleanly
+    reg_to = FallbackRegistry()
+    sg_to = CoordinatedStepGuard(
+        world_size=4,
+        rank=0,
+        comm_timeout_s=0.2,
+        raise_on_fault=True,
+        fallback_registry=reg_to,
+        all_reduce_status_fn=lambda vec: (time.sleep(2.0), vec)[1],
+    )
+    caught = None
+    try:
+        sg_to.check_step_health(local_ok=True)
+    except DistributedCommTimeoutError as exc:
+        caught = exc
+    assert caught is not None
+    assert sg_to.faulted
+    assert reg_to.summary()["total_fallbacks"] == 1
+
+
+def test_multiprocess_gloo_sigkill_stall_and_asymmetric_oom_recovery():
+    import signal
+    import subprocess
+
+    try:
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_gloo_available()):
+            return
+    except Exception:
+        return
+
+    worker_code = (
+        "import datetime, os, signal, sys, time, torch.distributed as dist\n"
+        "from triton.runtime import (\n"
+        "    CoordinatedStepGuard,\n"
+        "    DistributedCommTimeoutError,\n"
+        "    DistributedRankFaultError,\n"
+        "    GLOBAL_FALLBACK_REGISTRY,\n"
+        "    RankDispatchState,\n"
+        "    init_default_dispatch_guard,\n"
+        "    reset_default_dispatch_guard,\n"
+        ")\n"
+        "mode = sys.argv[1]\n"
+        "rank = int(sys.argv[2])\n"
+        "init_file = sys.argv[3]\n"
+        "GLOBAL_FALLBACK_REGISTRY.clear()\n"
+        "dist.init_process_group("
+        "backend='gloo', init_method=f'file://{init_file}', "
+        "rank=rank, world_size=2, timeout=datetime.timedelta(seconds=20))\n"
+        "g = init_default_dispatch_guard("
+        "create_gloo_group=True, comm_timeout_s=1.2, raise_on_fault=True)\n"
+        "sg = CoordinatedStepGuard(dispatch_guard=g, comm_timeout_s=1.2, raise_on_fault=True)\n"
+        "dist.barrier()\n"
+        "if mode == 'sigkill':\n"
+        "    if rank == 1:\n"
+        "        time.sleep(0.15)\n"
+        "        os.kill(os.getpid(), signal.SIGKILL)\n"
+        "    t0 = time.monotonic()\n"
+        "    try:\n"
+        "        sg.check_step_health(local_ok=True, op_name='mp_sigkill')\n"
+        "        sys.exit(2)\n"
+        "    except (DistributedRankFaultError, DistributedCommTimeoutError):\n"
+        "        assert time.monotonic() - t0 < 4.0\n"
+        "        assert GLOBAL_FALLBACK_REGISTRY.summary()['total_fallbacks'] >= 1\n"
+        "        sg.cleanup_after_fault(destroy_world=True)\n"
+        "        reset_default_dispatch_guard()\n"
+        "        sys.exit(0)\n"
+        "elif mode == 'stall':\n"
+        "    if rank == 1:\n"
+        "        time.sleep(6.0)\n"
+        "        sys.exit(0)\n"
+        "    t0 = time.monotonic()\n"
+        "    try:\n"
+        "        g.negotiate(RankDispatchState.ALL_HOT_HIT)\n"
+        "        sys.exit(2)\n"
+        "    except DistributedCommTimeoutError:\n"
+        "        assert time.monotonic() - t0 < 3.5\n"
+        "        assert GLOBAL_FALLBACK_REGISTRY.summary()['total_fallbacks'] >= 1\n"
+        "        g.cleanup_after_fault(destroy_world=True)\n"
+        "        reset_default_dispatch_guard()\n"
+        "        sys.exit(0)\n"
+        "elif mode == 'oom':\n"
+        "    def step_fn():\n"
+        "        if rank == 1:\n"
+        "            raise RuntimeError('CUDA out of memory')\n"
+        "        return 10\n"
+        "    val, health = sg.run_coordinated_step(\n"
+        "        'mp_oom', 'training', 4, step_fn,\n"
+        "        split_fn=lambda s: s * 100,\n"
+        "    )\n"
+        "    assert health.all_ok and val == 200\n"
+        "    assert GLOBAL_FALLBACK_REGISTRY.summary()['total_fallbacks'] >= 2\n"
+        "    dist.barrier()\n"
+        "    reset_default_dispatch_guard()\n"
+        "    dist.destroy_process_group()\n"
+        "    sys.exit(0)\n"
+    )
+
+    for mode in ("sigkill", "stall", "oom"):
+        with tempfile.TemporaryDirectory(prefix=f"ft_gloo_g05_{mode}_") as tmpd:
+            init_f = os.path.join(tmpd, "rdv")
+            procs = [
+                subprocess.Popen(
+                    [sys.executable, "-c", worker_code, mode, str(r), init_f],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for r in (0, 1)
+            ]
+            try:
+                out0, err0 = procs[0].communicate(timeout=12)
+                assert procs[0].returncode == 0, f"mode={mode} r0 rc={procs[0].returncode}:\n{out0}\n{err0}"
+                if mode == "oom":
+                    out1, err1 = procs[1].communicate(timeout=12)
+                    assert procs[1].returncode == 0, f"mode={mode} r1 rc={procs[1].returncode}:\n{out1}\n{err1}"
+                elif mode == "sigkill":
+                    procs[1].wait(timeout=5)
+                    assert procs[1].returncode == -signal.SIGKILL
+                else:
+                    if procs[1].poll() is None:
+                        procs[1].kill()
+                    procs[1].wait(timeout=5)
+            finally:
+                for p in procs:
+                    if p.poll() is None:
+                        p.kill()
+                        p.wait(timeout=3)

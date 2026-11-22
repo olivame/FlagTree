@@ -102,3 +102,69 @@ class CompileTimeoutError(TritonError):
 
     def __reduce__(self):
         return (type(self), (self.timeout_sec, self.kernel_name, self.config_desc))
+class DistributedCommTimeoutError(TritonError):
+    """Raised when a distributed coordination collective exceeds its timeout."""
+
+    def __init__(
+        self,
+        rank: int = 0,
+        world_size: int = 1,
+        op: str = "all_reduce",
+        phase: str = "dispatch",
+        timeout_s: float = 0.0,
+        cause: Optional[str] = None,
+    ):
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.op = str(op)
+        self.phase = str(phase)
+        self.timeout_s = float(timeout_s)
+        self.cause = None if cause is None else str(cause)
+
+    def __str__(self) -> str:
+        detail = f": {self.cause}" if self.cause else ""
+        return (
+            f"Distributed communication timed out after {self.timeout_s:.2f}s "
+            f"(rank={self.rank}/{self.world_size}, op={self.op}, phase={self.phase}){detail}"
+        )
+
+    def __reduce__(self):
+        return (
+            type(self),
+            (self.rank, self.world_size, self.op, self.phase, self.timeout_s, self.cause),
+        )
+
+
+class DistributedRankFaultError(TritonError):
+    """Raised when a peer rank crashes or a distributed collective backend fails."""
+
+    def __init__(
+        self,
+        rank: int = 0,
+        world_size: int = 1,
+        op: str = "all_reduce",
+        phase: str = "dispatch",
+        timeout_s: Optional[float] = None,
+        cause: Optional[str] = None,
+    ):
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.op = str(op)
+        self.phase = str(phase)
+        self.timeout_s = None if timeout_s is None else float(timeout_s)
+        self.cause = None if cause is None else str(cause)
+
+    def __str__(self) -> str:
+        timeout_part = f", timeout_s={self.timeout_s:.2f}s" if self.timeout_s is not None else ""
+        detail = f": {self.cause}" if self.cause else ""
+        return (
+            f"Distributed rank fault detected "
+            f"(rank={self.rank}/{self.world_size}, op={self.op}, phase={self.phase}"
+            f"{timeout_part}){detail}"
+        )
+
+    def __reduce__(self):
+        return (
+            type(self),
+            (self.rank, self.world_size, self.op, self.phase, self.timeout_s, self.cause),
+        )
