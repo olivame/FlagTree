@@ -4,6 +4,37 @@ All notable changes for the FlagOS **F09 (Universal & Portable Dynamic Shape Buc
 
 ---
 
+## [v0.3.1-f09] — 2026-11-23
+
+### Runtime Alignment Contract & Cache-First Fix (`fix/f09-v031-alignment-contract-and-cache-first`)
+- **Cross-Layer Alignment Contract (`triton/runtime/jit.py`)**:
+  - Added `JITFunction._strip_alignment_on_indices()` (via generic `backend_caps` alignment tags) and
+    `_bkt_force_unaligned_indices` so an outer bucket cache (such as FlagGems `LibEntry`) can require
+    alignment-agnostic compilation whenever an aligned runtime scalar maps into an unaligned-compatible cache slot.
+  - Established 3-branch cache-first lookup (`norm_kernel` unaligned reuse > `exact_kernel` aligned reuse
+    signaling `_bkt_last_run_used_exact_aligned=True` > cold compile with `norm_spec`), preventing both
+    cross-call static-axis cache invalidation and aligned-binary leakage into unaligned cache entries.
+- **Heuristics Cache-First Preservation (`triton/runtime/autotuner.py`)**:
+  - Added cache-first check in `Heuristics.run` so online dynamic-axis promotion never orphans already-compiled
+    kernels in `JITFunction.kernel_cache`, while recording `_ft_last_eval` and `_ft_last_used_raw` so outer caches
+    always bind exact heuristic constexprs.
+- **Stride Unaligned Consistency (`triton/runtime/shape_bucketing.py`)**:
+  - Unified `OnlineBucketPolicy._normalize_stride_value` with scalar dimension normalization by checking
+    `axis_name not in self._unaligned_axes`, eliminating cross-bucket stride recompile churn.
+- **Verification**:
+  - Unit tests: `50/50 PASSED` (including 2 new v0.3.1 regression tests in
+    `test_runtime_bucketing_and_cache_budget.py`).
+  - Real PPU-ZW810E `torch.bmm` varlen micro-repro (`S=126, 512, 53, 91`): `v0.3.0-f09` `141.10s / 176 .hgbin`
+    (`OFF 86.29s / 124 .hgbin`) -> **`58.49s / 63 .hgbin`** (`1.48x` faster than `OFF`, `-49.2%` `.hgbin`, 0
+    recompiles after step 0).
+  - Large-scale 656-model `x-benchmark v4` evaluation on 16x PPU-ZW810E: eliminated `59/59` hardware alignment
+    launch failures (`HGGC: invalid global mem access alignment`), `13/13` cross-bucket numerical corruptions
+    (restored to `cos=0.999998–1.000000`), and `2/2` abnormal OOMs (`75/75` clean sweep; merged 656-model run:
+    `500/656` ON success, `450 PASS` `cold_gmean=1.305x`, `rest_gmean=1.739x`, `steady_gmean=1.092x`,
+    `.hgbin -26.2%`; pure V3 69-model subset: `cold_gmean=1.666x`, `rest_gmean=3.295x`, `.hgbin -50.3%`).
+
+---
+
 ## [v0.3.0-f09] — 2026-11-23
 
 ### Documentation & Release Notes (`docs/f09-v030-release-notes`)

@@ -776,6 +776,35 @@ class Heuristics(KernelInterface):
                 self._ft_bucket_policy = policy
             policy.observe_args(env)
             evaluated = evaluate_heuristics_for_bucketing(self.values, env, policy)
+            # Cache-first guard: if raw heuristic values already hit a compiled
+            # JIT binary in kernel_cache, keep raw values so online dynamic-axis
+            # promotion (e.g. QK K=64 vs PV K=S in bmm) never orphans compiled
+            # binaries or triggers spurious recompiles.
+            raw_eval = {}
+            raw_env = dict(env)
+            for _v, _h in self.values.items():
+                _rv = _h(raw_env)
+                raw_eval[_v] = _rv
+                raw_env[_v] = _rv
+            self._ft_last_used_raw = False
+            if raw_eval != evaluated and hasattr(self.fn, "device_caches"):
+                try:
+                    _dev = driver.active.get_current_device()
+                    _kcache, _kkcache, _, _, _binder = self.fn.device_caches[_dev]
+                    if _kcache and _binder is not None:
+                        _rk_kwargs = {k: v for k, v in kwargs.items() if k not in ("grid", "warmup")}
+                        _rk_debug = _rk_kwargs.get("debug", getattr(self.fn, "debug", False))
+                        _rk_kwargs["debug"] = _rk_debug or knobs.runtime.debug
+                        _rk_kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
+                        _rk_kwargs.update(raw_eval)
+                        _, _rspec, _ropts = _binder(*args, **_rk_kwargs)
+                        from .jit import compute_cache_key as _cck
+                        if _cck(_kkcache, _rspec, _ropts) in _kcache:
+                            evaluated = raw_eval
+                            self._ft_last_used_raw = True
+                except Exception:
+                    pass
+            self._ft_last_eval = dict(evaluated)
             kwargs.update(evaluated)
         else:
             for v, heur in self.values.items():

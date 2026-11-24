@@ -498,8 +498,10 @@ class OnlineBucketPolicy:
         if iv <= 4:
             return ("s_exact", iv)
         bucket_hi = geometric_bucket_ceil(iv, self._ladder_for(axis_name), min_floor=1)
-        align_ok = (iv % self.divisibility) == 0 and (
-            (axis_name, bucket_hi) not in self._unaligned_buckets
+        align_ok = (
+            (iv % self.divisibility) == 0
+            and (axis_name, bucket_hi) not in self._unaligned_buckets
+            and axis_name not in self._unaligned_axes
         )
         spec = self.axis_specs.get(axis_name)
         paired_dims: Tuple[str, ...] = ()

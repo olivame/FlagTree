@@ -221,5 +221,77 @@ class TestRuntimeBucketingAndCacheBudget(unittest.TestCase):
         for forbidden in ("op_affiliation", "row_sign", "col_sign", "n_elem_sign", "generate_configs"):
             self.assertNotIn(forbidden, sig_params)
 
+
+    def test_v031_jit_force_unaligned_and_stride_consistency(self):
+        from triton.runtime.jit import JITFunction
+        from triton.runtime.shape_bucketing import OnlineBucketPolicy
+
+        # 1. _strip_alignment_on_indices strips only requested int indices
+        dummy_jf = object.__new__(JITFunction)
+        dummy_jf._bkt_align_tags = ("D",)
+        dummy_jf._bkt_unaligned_int_buckets = set()
+        bound = {"ptr": object(), "M": 1008, "K": 64, "N": 1}
+        spec = [("*fp16", "D"), ("i32", "D"), ("i32", "D"), ("i32", "1")]
+        stripped = dummy_jf._strip_alignment_on_indices(bound, spec, {1})
+        self.assertEqual(stripped[0], ("*fp16", "D"))
+        self.assertEqual(stripped[1], ("i32", ""))
+        self.assertEqual(stripped[2], ("i32", "D"))
+        self.assertEqual(stripped[3], ("i32", "1"))
+
+        # 2. OnlineBucketPolicy._normalize_stride_value stays consistent with _unaligned_axes
+        pol = OnlineBucketPolicy(divisibility=16)
+        pol.observe_args({"stride_bk": 126})
+        self.assertIn("stride_bk", pol._unaligned_axes)
+        tok = pol.normalize_entry_scalar("stride_bk", 64, is_autotuned_key=True, all_args={})
+        self.assertEqual(tok[0], "ft_tune_stride")
+        self.assertIs(tok[-2], False)
+        self.assertIs(tok[1][-1], False)
+
+    def test_v031_heuristics_cache_first_records_last_eval(self):
+        from types import SimpleNamespace
+        from triton import knobs
+        from triton.runtime.autotuner import Heuristics
+        from triton.runtime.shape_bucketing import OnlineBucketPolicy
+
+        calls = []
+        class _DummyJIT:
+            arg_names = ["K"]
+            debug = False
+            def __init__(self):
+                self._kcache = {}
+                self._kkcache = {}
+                def _binder(*args, **kwargs):
+                    spec = [("i32", "D" if args[0] % 16 == 0 else ""), ("constexpr", kwargs.get("FULL_K"))]
+                    return {"K": args[0], "FULL_K": kwargs.get("FULL_K")}, spec, {}
+                self.device_caches = {0: (self._kcache, self._kkcache, None, None, _binder)}
+            def run(self, *args, **kwargs):
+                calls.append((args[0], kwargs.get("FULL_K")))
+                from triton.runtime.jit import compute_cache_key
+                _, spec, opts = self.device_caches[0][4](*args, **kwargs)
+                self._kcache[compute_cache_key(self._kkcache, spec, opts)] = "bin"
+                return "bin"
+
+        jf = _DummyJIT()
+        h = Heuristics(jf, ["K"], {"FULL_K": lambda a: a["K"] % 64 == 0})
+        pol = OnlineBucketPolicy(divisibility=16)
+        h._ft_bucket_policy = pol
+        prev_bkt = knobs.autotuning.shape_bucketing
+        try:
+            knobs.autotuning.shape_bucketing = True
+            # Step 0: static aligned K=64 compiles FULL_K=True
+            h.run(64, grid=(1,), warmup=False)
+            self.assertEqual(h._ft_last_eval, {"FULL_K": True})
+            self.assertFalse(h._ft_last_used_raw)
+            # Step 1: dynamic unaligned K=53 promotes K to dynamic
+            h.run(53, grid=(1,), warmup=False)
+            self.assertEqual(h._ft_last_eval, {"FULL_K": False})
+            # Step 2: K=64 returns -> cache-first hits compiled FULL_K=True and sets _ft_last_used_raw
+            h.run(64, grid=(1,), warmup=False)
+            self.assertEqual(h._ft_last_eval, {"FULL_K": True})
+            self.assertTrue(h._ft_last_used_raw)
+            self.assertEqual(calls, [(64, True), (53, False), (64, True)])
+        finally:
+            knobs.autotuning.shape_bucketing = prev_bkt
+
 if __name__ == "__main__":
     unittest.main()

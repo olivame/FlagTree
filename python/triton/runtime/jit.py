@@ -801,11 +801,48 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # specialization is list[tuple[str, Any]], where first element of tuple is
         # the type and the second parameter is the 'specialization' value.
         bound_args, specialization, options = binder(*args, **kwargs)
-        if getattr(knobs.autotuning, "shape_bucketing", False):
-            specialization = self._normalize_specialization_for_bucketing(bound_args, specialization)
-
-        key = compute_cache_key(kernel_key_cache, specialization, options)
-        kernel = kernel_cache.get(key, None)
+        self._bkt_last_run_used_exact_aligned = False
+        force_unaligned = getattr(self, "_bkt_force_unaligned_indices", None)
+        if force_unaligned and getattr(knobs.autotuning, "shape_bucketing", False):
+            norm_spec = self._strip_alignment_on_indices(bound_args, specialization, force_unaligned)
+            norm_key = compute_cache_key(kernel_key_cache, norm_spec, options)
+            norm_kernel = kernel_cache.get(norm_key, None)
+            if norm_kernel is not None:
+                specialization = norm_spec
+                key = norm_key
+                kernel = norm_kernel
+            else:
+                exact_key = compute_cache_key(kernel_key_cache, specialization, options)
+                exact_kernel = kernel_cache.get(exact_key, None)
+                if exact_kernel is not None:
+                    # Reuse already-compiled aligned binary (0 recompile) and signal
+                    # LibEntry so it stores under raw_entry_key, never unaligned key!
+                    key = exact_key
+                    kernel = exact_kernel
+                    self._bkt_last_run_used_exact_aligned = True
+                else:
+                    # Cold compile must be unaligned-safe for the bucket slot.
+                    specialization = norm_spec
+                    key = norm_key
+                    kernel = None
+        else:
+            key = compute_cache_key(kernel_key_cache, specialization, options)
+            kernel = kernel_cache.get(key, None)
+            if getattr(knobs.autotuning, "shape_bucketing", False):
+                if kernel is not None:
+                    # Already have an exact compiled binary (e.g. aligned static axis);
+                    # never invalidate it! Still record unaligned scalar observations.
+                    self._record_unaligned_int_buckets(bound_args, specialization)
+                else:
+                    norm_spec = self._normalize_specialization_for_bucketing(bound_args, specialization)
+                    if norm_spec is not specialization:
+                        norm_key = compute_cache_key(kernel_key_cache, norm_spec, options)
+                        norm_kernel = kernel_cache.get(norm_key, None)
+                        eager_indices = getattr(self, "_bkt_eager_unaligned_indices", None)
+                        if norm_kernel is not None or eager_indices:
+                            specialization = norm_spec
+                            key = norm_key
+                            kernel = norm_kernel
 
         # Kernel is not cached; we have to compile.
         if kernel is None:
@@ -890,6 +927,65 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # scoped by (arg_idx, bucket_hi) so a dynamic axis in one bucket never
         # strips alignment from a static axis (e.g. head_dim=64) in another.
         self._bkt_unaligned_int_buckets = set()
+
+    def _strip_alignment_on_indices(self, bound_args, specialization, force_indices):
+        """Unconditionally strip backend divisibility specialization on exact
+        param indices requested by an outer bucket cache (e.g. LibEntry) so an
+        aligned binary can never be stored under an unaligned-compatible key."""
+        tags = getattr(self, "_bkt_align_tags", None)
+        if tags is None:
+            caps = _get_backend_capabilities()
+            tags = caps.alignment_spec_tags
+            self._bkt_align_tags = tags
+            self._bkt_caps = caps
+        out = None
+        if tags == ("D",):
+            for idx, val in enumerate(bound_args.values()):
+                if idx in force_indices and type(val) is int:
+                    spec = specialization[idx]
+                    if type(spec) is tuple and len(spec) == 2:
+                        ty, sp = spec
+                        if (ty == "i32" or ty == "i64" or ty == "u32" or ty == "u64") and type(sp) is str:
+                            if sp == "D" or "D" in sp:
+                                if out is None:
+                                    out = list(specialization)
+                                out[idx] = (ty, "" if sp == "D" else sp.replace("D", ""))
+            return out if out is not None else specialization
+        caps = self._bkt_caps
+        for idx, (val, spec) in enumerate(zip(bound_args.values(), specialization)):
+            if idx in force_indices and type(val) is int:
+                norm_spec, was_aligned, _ = _strip_int_alignment_spec(spec, caps)
+                if was_aligned:
+                    if out is None:
+                        out = list(specialization)
+                    out[idx] = norm_spec
+        return out if out is not None else specialization
+
+    def _record_unaligned_int_buckets(self, bound_args, specialization):
+        tags = getattr(self, "_bkt_align_tags", None)
+        if tags is None:
+            caps = _get_backend_capabilities()
+            tags = caps.alignment_spec_tags
+            self._bkt_align_tags = tags
+            self._bkt_caps = caps
+        unaligned = self._bkt_unaligned_int_buckets
+        if tags == ("D",):
+            idx = 0
+            for val in bound_args.values():
+                if type(val) is int:
+                    spec = specialization[idx]
+                    if type(spec) is tuple and len(spec) == 2:
+                        ty, sp = spec
+                        if (ty == "i32" or ty == "i64" or ty == "u32" or ty == "u64") and sp == "":
+                            unaligned.add((idx, _jit_bkt_ceil(val)))
+                idx += 1
+            return
+        caps = self._bkt_caps
+        for idx, (val, spec) in enumerate(zip(bound_args.values(), specialization)):
+            if type(val) is int:
+                _, _, is_unaligned_int = _strip_int_alignment_spec(spec, caps)
+                if is_unaligned_int:
+                    unaligned.add((idx, _jit_bkt_ceil(val)))
 
     def _normalize_specialization_for_bucketing(self, bound_args, specialization):
         """Strip backend divisibility specialization on scalar int args once an
