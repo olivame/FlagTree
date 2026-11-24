@@ -245,8 +245,10 @@ class Autotuner(KernelInterface):
 
         def _invoke_bench():
             global _EVENT_TIMER_ZERO_DIV
-            if _EVENT_TIMER_ZERO_DIV and self._do_bench is None:
-                return _wallclock_bench_fallback(kernel_call)
+            if self._do_bench is None:
+                from .backend_caps import get_backend_capabilities
+                if _EVENT_TIMER_ZERO_DIV or not get_backend_capabilities().supports_event_timing:
+                    return _wallclock_bench_fallback(kernel_call)
             try:
                 return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
             except ZeroDivisionError:
@@ -419,7 +421,7 @@ class Autotuner(KernelInterface):
             else:
                 key = raw_key
 
-            if has_dynamic_cand_gen and not (bucketing_enabled and key in self.cache):
+            if has_dynamic_cand_gen and key not in self.cache:
                 from .backend_caps import resolve_candidate_generator
                 cand_fn = resolve_candidate_generator()
                 if cand_fn is not None:
@@ -796,6 +798,10 @@ class Heuristics(KernelInterface):
                         _rk_debug = _rk_kwargs.get("debug", getattr(self.fn, "debug", False))
                         _rk_kwargs["debug"] = _rk_debug or knobs.runtime.debug
                         _rk_kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
+                        from .backend_caps import get_backend_capabilities as _get_caps
+                        _rk_caps = _get_caps()
+                        if _rk_caps.bakes_static_grid and "grid" in kwargs:
+                            _rk_kwargs["grid"] = _rk_caps.canonicalize_compile_grid(kwargs["grid"])
                         _rk_kwargs.update(raw_eval)
                         _, _rspec, _ropts = _binder(*args, **_rk_kwargs)
                         from .jit import compute_cache_key as _cck

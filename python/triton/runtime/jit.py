@@ -37,7 +37,10 @@ from typing import Callable, Generic, Iterable, Optional, TypeVar, overload, Dic
 from triton.backends import BaseBackend
 from types import ModuleType
 from .. import knobs
-from flagtree import _flagprism  # FlagPrism
+try:
+    from flagtree import _flagprism  # FlagPrism
+except ImportError:
+    _flagprism = None
 from .driver import driver
 from .backend_caps import (
     get_backend_capabilities as _get_backend_capabilities,
@@ -749,9 +752,16 @@ class JITFunction(JITCallable, KernelInterface[T]):
         Precompute as much as possible.
         """
         from ..compiler import CompiledKernel, compile, ASTSource, make_backend
-        from ..backends import route_target
-        target = driver.active.get_current_target()
-        target = route_target(target, self)  # flagtree tileir: support target routing
+        _get_tgt = getattr(
+            driver.active, "get_current_target_inside", driver.active.get_current_target
+        )
+        target = _get_tgt()
+        try:
+            from ..backends import route_target
+        except ImportError:
+            route_target = None
+        if route_target is not None:
+            target = route_target(target, self)  # flagtree tileir: support target routing
         backend = make_backend(target)
         self.CompiledKernel = CompiledKernel
         self.compile = compile
@@ -787,7 +797,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
         kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
         # FlagPrism: options must affect specialization and cache keys.
-        _flagprism.apply_compile_options(kwargs)
+        if _flagprism is not None:
+            _flagprism.apply_compile_options(kwargs)
 
         # parse options
         device = driver.active.get_current_device()
@@ -798,6 +809,12 @@ class JITFunction(JITCallable, KernelInterface[T]):
             hook(*args, **kwargs)
 
         kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[device]
+        caps = _get_backend_capabilities()
+        if caps.bakes_static_grid:
+            if getattr(knobs.autotuning, "shape_bucketing", False):
+                kwargs["grid"] = caps.canonicalize_compile_grid(grid)
+            else:
+                kwargs["grid"] = grid
         # specialization is list[tuple[str, Any]], where first element of tuple is
         # the type and the second parameter is the 'specialization' value.
         bound_args, specialization, options = binder(*args, **kwargs)
@@ -1258,6 +1275,9 @@ class TensorWrapper:
 
     def data_ptr(self):
         return self.base.data_ptr()
+
+    def numel(self):
+        return self.base.numel()
 
     def stride(self, *args):
         return self.base.stride(*args)

@@ -4,6 +4,34 @@ All notable changes for the FlagOS **F09 (Universal & Portable Dynamic Shape Buc
 
 ---
 
+## [v0.3.2-f09] — 2026-11-24
+
+### Declarative Second-Chip XPU Port & Hot-Path Env Cache (`feat/f09-v032-xpu-port-and-hotpath-cache`)
+- **Declarative Backend Capabilities (`triton/runtime/backend_caps.py`, `jit.py`, `autotuner.py`)**:
+  - Added `binary_ext`, `static_grid_specializations`, and `canonicalize_compile_grid()` to
+    `BackendBucketingCapabilities` so backends with static baked launch grids collapse dynamic grids to
+    compiler-distinguishable equivalence classes without vendor branching in core runtime.
+  - Added `supports_event_timing` wall-clock benchmark fallback in `Autotuner` and `TensorWrapper.numel()`.
+  - Added fast pre-encoded `os.environ._data` dict lookup in `get_backend_capabilities()` (with automatic
+    invalidation in `register_backend_capabilities()` and fallback to `os.environ.get`), plus a fast tuple path
+    in `canonicalize_compile_grid()`, eliminating per-launch env-key encoding overhead on all backends.
+- **Verification (Dual-Chip: T-Head PPU-ZW810E + Kunlunxin P800)**:
+  - Unit tests: **`62/62 PASSED`** (including `test_canonicalize_compile_grid_and_tensor_wrapper_numel` and
+    `test_fast_env_cache_invalidation_on_env_and_register`).
+  - Kunlunxin P800 L1 pure FlagTree (zero FlagGems): `6/6` core LLM kernels PASS (`cold 1.36–1.91x`, unseen
+    `102–403x` with `+0 .xpubin`, `.xpubin -88.0% ~ -92.6%`, LRU `max_xpubin=2<=4`, restart `6.55x` `new=0`).
+  - Kunlunxin P800 L2 62 unique local models (`40/48 = 83.3%` ATen-loadable PASS, `0` ON-only regressions,
+    `cold_gmean=1.765x`, `rest_gmean=2.016x`, `.xpubin -45.93%`, `cos(ON,OFF) >= 0.999989`); after hot-path
+    env-cache optimization, 6 worst-tail steady models flipped from `0.951x` -> **`1.015x` (batched) / `1.028x`
+    (per-step)** with `max_abs=0.0`.
+  - Native `libbkcl.so` single-node (`4x`/`7x` XPU-Link, `AR 37.93–46.89 GB/s`) and 2-node cross-node (`2x2=4x`
+    200GbE RoCE v2 + XPU-Link, `AR 55.09 GB/s`, `P2P 31.76 GB/s`): `F09-G04` hardware-adaptive Top-1 flip from
+    PPU `dp_pp(2x2)` (`5.34x` over `dp_tp`) to P800 `dp_tp(2x2)` (`1.69–1.71x` over `dp_pp`, `rho=1.0`);
+    `F09-G05` **`12/12 PASS`** across `4x`, `7x`, and cross-node `2x2` (`max_rank_param_diff=0.0`, closing
+    `EX-004`/`KI-04`).
+
+---
+
 ## [v0.3.1-f09] — 2026-11-23
 
 ### Runtime Alignment Contract & Cache-First Fix (`fix/f09-v031-alignment-contract-and-cache-first`)

@@ -20,10 +20,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from triton._flagtree_spec import spec_path
+try:
+    from triton._flagtree_spec import spec_path
+except ImportError:
+    try:
+        from triton.flagtree_spec import spec_path
+    except ImportError:
+        spec_path = None
 
 # flagtree backend path specialization
-spec_path(__path__)
+if spec_path is not None:
+    spec_path(__path__)
 
 from .autotuner import (Autotuner, Config, Heuristics, autotune, heuristics)
 from .cache import RedisRemoteCacheBackend, RemoteCacheBackend

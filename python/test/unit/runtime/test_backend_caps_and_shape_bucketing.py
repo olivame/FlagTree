@@ -79,6 +79,61 @@ class TestBackendCapabilities(unittest.TestCase):
         register_backend_capabilities("mock_asic", updated)
         self.assertEqual(get_backend_capabilities("mock_asic").divisibility, 64)
 
+    def test_canonicalize_compile_grid_and_tensor_wrapper_numel(self):
+        xpu_caps = get_backend_capabilities("xpu")
+        self.assertTrue(xpu_caps.bakes_static_grid)
+        self.assertEqual(xpu_caps.binary_ext, "xpubin")
+        self.assertFalse(xpu_caps.supports_event_timing)
+        self.assertFalse(xpu_caps.supports_cudagraph_bench)
+        self.assertEqual(xpu_caps.canonicalize_compile_grid((277, 1, 1)), (1, 1, 1))
+        self.assertEqual(xpu_caps.canonicalize_compile_grid((291, 1, 1)), (1, 1, 1))
+        self.assertEqual(xpu_caps.canonicalize_compile_grid((12, 1, 1)), (12, 1, 1))
+        self.assertEqual(xpu_caps.canonicalize_compile_grid(lambda m: (m["M"],)), (1, 1, 1))
+
+        strict_caps = BackendBucketingCapabilities(
+            backend="strict_grid_asic",
+            bakes_static_grid=True,
+            static_grid_specializations=(),
+        )
+        self.assertEqual(strict_caps.canonicalize_compile_grid((277, 1, 1)), (277, 1, 1))
+        self.assertEqual(strict_caps.canonicalize_compile_grid((291, 1, 1)), (291, 1, 1))
+        self.assertIsNone(get_backend_capabilities("nvidia").canonicalize_compile_grid((12, 1, 1)))
+
+        class _DummyTensor:
+            def __init__(self):
+                self.dtype = "float16"
+                self.data = self
+                self.device = "cpu"
+                self.shape = (4096,)
+            def data_ptr(self):
+                return 0x1000
+            def numel(self):
+                return 4096
+            def stride(self, *args):
+                return (1,)
+
+        import triton
+        tw = triton.runtime.TensorWrapper(_DummyTensor(), "float16")
+        self.assertEqual(tw.numel(), 4096)
+
+    def test_fast_env_cache_invalidation_on_env_and_register(self):
+        prev_sg = os.environ.get("FLAGTREE_BAKES_STATIC_GRID")
+        try:
+            os.environ["FLAGTREE_BAKES_STATIC_GRID"] = "0"
+            c0 = get_backend_capabilities(vendor_name="nvidia")
+            self.assertFalse(c0.bakes_static_grid)
+            os.environ["FLAGTREE_BAKES_STATIC_GRID"] = "1"
+            c1 = get_backend_capabilities(vendor_name="nvidia")
+            self.assertTrue(c1.bakes_static_grid)
+            os.environ["FLAGTREE_BAKES_STATIC_GRID"] = "0"
+            c2 = get_backend_capabilities(vendor_name="nvidia")
+            self.assertFalse(c2.bakes_static_grid)
+        finally:
+            if prev_sg is None:
+                os.environ.pop("FLAGTREE_BAKES_STATIC_GRID", None)
+            else:
+                os.environ["FLAGTREE_BAKES_STATIC_GRID"] = prev_sg
+
     def test_env_overrides_and_base_backend_hook(self):
         self.assertTrue(hasattr(BaseBackend, "get_bucketing_capabilities"))
         prev_div = os.environ.get("FLAGTREE_BUCKET_DIVISIBILITY")

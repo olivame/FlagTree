@@ -29,6 +29,11 @@ import unittest
 
 
 def _ensure_triton_importable() -> None:
+    try:
+        from triton._C.libtriton import getenv as _g  # noqa: F401
+        return
+    except Exception:
+        pass
     repo_python = Path(__file__).resolve().parents[2]
     if str(repo_python) not in sys.path:
         sys.path.insert(0, str(repo_python))

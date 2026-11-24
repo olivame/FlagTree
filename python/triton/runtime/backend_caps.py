@@ -55,6 +55,8 @@ class BackendBucketingCapabilities:
     fp8_min_dot_size: Tuple[int, int, int] = (16, 16, 32)
     min_load_size: int = 1
     bakes_static_grid: bool = False
+    binary_ext: Optional[str] = None
+    static_grid_specializations: Tuple[Tuple[int, ...], ...] = ()
     default_num_stages: int = 3
     candidate_generator_module: Optional[str] = None
     candidate_generator_attr: str = "block_size_candidates"
@@ -79,6 +81,35 @@ class BackendBucketingCapabilities:
             fm, fn, fk = self.fp8_min_dot_size
             return (int(fm), int(fn), max(32, int(fk)))
         return self.min_dot_size
+
+    def canonicalize_compile_grid(self, grid: Any) -> Any:
+        """Collapse launch grid to its compiler-distinguishable equivalence class.
+
+        Backends with ``bakes_static_grid=True`` and non-empty
+        ``static_grid_specializations`` only emit distinct codegen for those
+        exact grid tuples, while all other dynamic grids share ``(1, 1, 1)``.
+        When ``static_grid_specializations`` is empty, every static tuple grid
+        is preserved conservatively while callables map to ``(1, 1, 1)``.
+        """
+        if not self.bakes_static_grid:
+            return None
+        specs = self.static_grid_specializations
+        if specs and type(grid) is tuple:
+            for spec in specs:
+                if grid == spec:
+                    return spec
+            return (1, 1, 1)
+        if callable(grid):
+            return (1, 1, 1)
+        try:
+            norm = tuple(int(x) for x in grid)
+        except Exception:
+            return (1, 1, 1) if specs else grid
+        if not specs:
+            return norm
+        if norm in specs:
+            return norm
+        return (1, 1, 1)
 
 
 _REGISTRY_LOCK = threading.Lock()
@@ -135,24 +166,30 @@ _DEFAULT_CAPABILITIES: Dict[str, BackendBucketingCapabilities] = {
         divisibility=16,
         min_dot_size=(16, 16, 16),
         bakes_static_grid=True,
+        binary_ext="xpubin",
+        static_grid_specializations=((12, 1, 1),),
         default_num_stages=2,
         candidate_generator_module="triton.runtime._xpu_autotune_candidates",
         collective_device="xpu",
         collective_backends=("xccl", "bkcl", "nccl", "flagcx"),
         graph_capture_apis=(("xpu", "XPUGraph", "graph"), ("cuda", "CUDAGraph", "graph")),
         supports_event_timing=False,
+        supports_cudagraph_bench=False,
     ),
     "kunlunxin": BackendBucketingCapabilities(
         backend="kunlunxin",
         divisibility=16,
         min_dot_size=(16, 16, 16),
         bakes_static_grid=True,
+        binary_ext="xpubin",
+        static_grid_specializations=((12, 1, 1),),
         default_num_stages=2,
         candidate_generator_module="triton.runtime._xpu_autotune_candidates",
         collective_device="xpu",
         collective_backends=("xccl", "bkcl", "nccl", "flagcx"),
         graph_capture_apis=(("xpu", "XPUGraph", "graph"), ("cuda", "CUDAGraph", "graph")),
         supports_event_timing=False,
+        supports_cudagraph_bench=False,
     ),
     "ascend": BackendBucketingCapabilities(
         backend="ascend",
@@ -283,7 +320,14 @@ def detect_active_backend_name() -> str:
     return "default"
 
 
-_ACTIVE_CAPS_CACHE: Dict[Tuple[str, str, str, str], BackendBucketingCapabilities] = {}
+_ENV_B_FLAGTREE_BACKEND = b"FLAGTREE_BACKEND"
+_ENV_B_TRITON_BACKEND = b"TRITON_BACKEND"
+_ENV_B_BUCKET_DIV = b"FLAGTREE_BUCKET_DIVISIBILITY"
+_ENV_B_STATIC_GRID = b"FLAGTREE_BAKES_STATIC_GRID"
+_ACTIVE_CAPS_CACHE: Dict[Tuple[str, str, str, str, str], BackendBucketingCapabilities] = {}
+_RAW_ACTIVE_CAPS_CACHE: Dict[
+    Tuple[bytes, bytes, bytes, bytes, str], BackendBucketingCapabilities
+] = {}
 _SORTED_TAGS_CACHE: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
 
 
@@ -296,6 +340,7 @@ def register_backend_capabilities(
     with _REGISTRY_LOCK:
         _DEFAULT_CAPABILITIES[key] = capabilities
         _ACTIVE_CAPS_CACHE.clear()
+        _RAW_ACTIVE_CAPS_CACHE.clear()
 
 
 _COMPILER_CAPS_CACHE: Dict[Any, Optional[BackendBucketingCapabilities]] = {}
@@ -330,19 +375,33 @@ def get_backend_capabilities(
     vendor_name: Optional[str] = None,
 ) -> BackendBucketingCapabilities:
     """Resolve effective BackendBucketingCapabilities for the active or requested backend."""
-    if backend is None and vendor_name is None:
+    env_key = None
+    raw_env_key = None
+    if backend is None:
         env = os.environ
-        env_key = (
-            env.get("FLAGTREE_BACKEND", ""),
-            env.get("TRITON_BACKEND", ""),
-            env.get("FLAGTREE_BUCKET_DIVISIBILITY", ""),
-            env.get("FLAGTREE_BAKES_STATIC_GRID", ""),
-        )
-        cached = _ACTIVE_CAPS_CACHE.get(env_key)
-        if cached is not None:
-            return cached
-    else:
-        env_key = None
+        raw_data = getattr(env, "_data", None)
+        if type(raw_data) is dict:
+            raw_env_key = (
+                raw_data.get(_ENV_B_FLAGTREE_BACKEND, b""),
+                raw_data.get(_ENV_B_TRITON_BACKEND, b""),
+                raw_data.get(_ENV_B_BUCKET_DIV, b""),
+                raw_data.get(_ENV_B_STATIC_GRID, b""),
+                vendor_name or "",
+            )
+            cached = _RAW_ACTIVE_CAPS_CACHE.get(raw_env_key)
+            if cached is not None:
+                return cached
+        else:
+            env_key = (
+                env.get("FLAGTREE_BACKEND", ""),
+                env.get("TRITON_BACKEND", ""),
+                env.get("FLAGTREE_BUCKET_DIVISIBILITY", ""),
+                env.get("FLAGTREE_BAKES_STATIC_GRID", ""),
+                vendor_name or "",
+            )
+            cached = _ACTIVE_CAPS_CACHE.get(env_key)
+            if cached is not None:
+                return cached
 
     explicit = canonicalize_backend_name(backend) if backend is not None else None
     if explicit is None:
@@ -379,7 +438,9 @@ def get_backend_capabilities(
     elif env_static_grid in ("0", "false", "off", "no"):
         base = replace(base, bakes_static_grid=False)
 
-    if env_key is not None:
+    if raw_env_key is not None:
+        _RAW_ACTIVE_CAPS_CACHE[raw_env_key] = base
+    elif env_key is not None:
         _ACTIVE_CAPS_CACHE[env_key] = base
     return base
 
